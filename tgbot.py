@@ -1,10 +1,10 @@
 import logging
 import os
-# Удаляем импорт Thread, threading больше не нужен
-# from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, request, Response
+# asyncio не нужен, Flask async views справляются
+# import asyncio
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
@@ -37,7 +37,6 @@ if not TOKEN:
     raise ValueError("Bot TOKEN not set")
 
 logger.info("Creating Application object...")
-# При использовании process_update, ApplicationBuilder не требует специфичной настройки для webhook
 telegram_application = Application.builder().token(TOKEN).build()
 logger.info("Application object created.")
 
@@ -45,23 +44,35 @@ logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
 logger.info("Command handlers added.")
 
-# --- Удаляем код с запуском треда ---
-# def run_ptb_application_in_thread():
-#    ...
-# ptb_thread = Thread(...)
-# ptb_thread.start()
-# logger.info("PTB Application background thread started.")
-# --- Конец кода с тредом ---
-
-
 # --- Настройка Flask приложения ---
 app = Flask(__name__)
 logger.info("Flask app created.")
 
+# Флаг для отслеживания инициализации Application
+# Инициализация произойдет при первом входящем запросе
+is_application_initialized = False
+
 @app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
 async def telegram_webhook_handler():
     """Обрабатывает входящие запросы от Телеграма."""
+    global is_application_initialized # Используем глобальный флаг
     logger.info("Received POST request on /webhook")
+
+    # Инициализируем Application, если это еще не сделано
+    if not is_application_initialized:
+        logger.info("Initializing Application...")
+        try:
+            # Application как асинхронный контекстный менеджер вызывает initialize() при входе и shutdown() при выходе
+            # В данном случае initialize() выполнится при первом запросе
+            # Нам не нужен долгоживущий контекст здесь, просто вызов initialize() достаточен перед process_update
+            # Вызовем initialize() явно, если флаг False
+            await telegram_application.initialize() # <-- ЯВНЫЙ ВЫЗОВ initialize()
+            is_application_initialized = True
+            logger.info("Application initialized.")
+        except Exception as e:
+            logger.error(f"Error during Application initialization: {e}")
+            # Если инициализация не удалась, возвращаем ошибку сервера
+            return Response(status=500)
 
     update_json = request.get_json()
     if not update_json:
@@ -76,28 +87,23 @@ async def telegram_webhook_handler():
          logger.error(f"Error parsing update JSON: {e}")
          return Response(status=400)
 
-    # --- ПЕРЕДАЕМ ОБНОВЛЕНИЕ Application ДЛЯ ОБРАБОТКИ ---
+    # --- Передаем обновление Application для обработки ---
+    # Теперь Application должен быть инициализирован
     logger.info(f"Processing update {update.update_id} using application.process_update...")
     try:
-        # Явно вызываем process_update для обработки этого обновления
+        # Вызываем process_update, который требует инициализированного Application
         await telegram_application.process_update(update)
         logger.info(f"Update {update.update_id} processing finished.")
     except Exception as e:
-        # Логируем любые ошибки, которые могут возникнуть во время обработки обновления внутри Application/хэндлера
         logger.error(f"Error processing update {update.update_id} in Application: {e}")
-        # Важно: даже если при обработке возникла ошибка, Телеграму лучше вернуть 200 OK,
-        # чтобы он не пытался повторно отправить это же обновление.
-        # Ошибки обработки мы логируем для себя.
-        pass # Просто пропускаем ошибку, чтобы вернуть 200 ниже
+        # Продолжаем возвращать 200, если ошибка внутри обработчика
+        pass
 
-
-    # Возвращаем ответ Телеграму, что запрос принят и обработан (или попытка обработки была выполнена)
+    # Возвращаем ответ Телеграму
     logger.info("Returning 200 OK to Telegram")
     return Response(status=200)
 
 # --- ТО, ЧТО НУЖНО GUNICORN ---
-# Gunicorn будет искать переменную 'application' на верхнем уровне.
-# Мы предоставляем Flask приложение.
 application = app
 logger.info("WSGI application variable set to Flask app.")
 # --- КОНЕЦ ТОГО, ЧТО НУЖНО GUNICORN ---
