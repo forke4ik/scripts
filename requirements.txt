@@ -2,3 +2,6 @@ python-telegram-bot[webhooks]
 gunicorn
 python-telegram-bot
 gunicorn
+python-telegram-bot[webhooks]
+gunicorn
+Flask # Добавляем Flask
