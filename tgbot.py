@@ -1,7 +1,7 @@
 import logging
 import os
-# import asyncio # Не нужно, тред будет использовать свой луп или синхронный раннер
-from threading import Thread # <-- Импортируем Thread
+# Удаляем импорт Thread, threading больше не нужен
+# from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, request, Response
@@ -37,6 +37,7 @@ if not TOKEN:
     raise ValueError("Bot TOKEN not set")
 
 logger.info("Creating Application object...")
+# При использовании process_update, ApplicationBuilder не требует специфичной настройки для webhook
 telegram_application = Application.builder().token(TOKEN).build()
 logger.info("Application object created.")
 
@@ -44,26 +45,13 @@ logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
 logger.info("Command handlers added.")
 
-# --- ЗАПУСК ЦИКЛА ОБРАБОТКИ Application В ОТДЕЛЬНОМ ПОТОКЕ ---
-# Эта функция будет выполняться в фоновом потоке,
-# вытягивая обновления из update_queue и передавая их диспатчеру.
-def run_ptb_application_in_thread():
-    logger.info("Starting PTB Application background processing loop in a separate thread...")
-    # run_until_disconnected() будет работать, пока приложение не будет остановлено извне
-    try:
-        telegram_application.run_until_disconnected()
-    except Exception as e:
-        logger.error(f"Exception in PTB Application thread: {e}")
-    logger.info("PTB Application background processing loop stopped.")
-
-# Создаем и запускаем отдельный поток для Application
-ptb_thread = Thread(target=run_ptb_application_in_thread)
-# daemon=True позволит основному процессу Flask/Gunicorn завершиться,
-# даже если этот поток еще работает (хотя Render сам управляет жизнью процесса)
-# ptb_thread.daemon = True # Можно добавить, но не всегда обязательно на хостингах
-ptb_thread.start()
-logger.info("PTB Application background thread started.")
-# --- КОНЕЦ ЗАПУСКА ЦИКЛА ОБРАБОТКИ ---
+# --- Удаляем код с запуском треда ---
+# def run_ptb_application_in_thread():
+#    ...
+# ptb_thread = Thread(...)
+# ptb_thread.start()
+# logger.info("PTB Application background thread started.")
+# --- Конец кода с тредом ---
 
 
 # --- Настройка Flask приложения ---
@@ -86,23 +74,24 @@ async def telegram_webhook_handler():
         logger.info(f"Update parsed: {update.update_id}")
     except Exception as e:
          logger.error(f"Error parsing update JSON: {e}")
-         # Возвращаем 400, если не можем распарсить обновление
          return Response(status=400)
 
-
-    logger.info(f"Putting update {update.update_id} into update queue...")
+    # --- ПЕРЕДАЕМ ОБНОВЛЕНИЕ Application ДЛЯ ОБРАБОТКИ ---
+    logger.info(f"Processing update {update.update_id} using application.process_update...")
     try:
-        # Добавляем обновление в очередь Application.
-        # Фоновый поток (запущенный выше) должен будет забрать его оттуда.
-        await telegram_application.update_queue.put(update)
-        logger.info(f"Update {update.update_id} successfully added to queue.")
+        # Явно вызываем process_update для обработки этого обновления
+        await telegram_application.process_update(update)
+        logger.info(f"Update {update.update_id} processing finished.")
     except Exception as e:
-         logger.error(f"Error putting update {update.update_id} into queue: {e}")
-         # Возвращаем 500, если не можем добавить в очередь (хотя это маловероятно)
-         return Response(status=500)
+        # Логируем любые ошибки, которые могут возникнуть во время обработки обновления внутри Application/хэндлера
+        logger.error(f"Error processing update {update.update_id} in Application: {e}")
+        # Важно: даже если при обработке возникла ошибка, Телеграму лучше вернуть 200 OK,
+        # чтобы он не пытался повторно отправить это же обновление.
+        # Ошибки обработки мы логируем для себя.
+        pass # Просто пропускаем ошибку, чтобы вернуть 200 ниже
 
 
-    # Возвращаем ответ Телеграму, что запрос принят и поставлен в очередь на обработку
+    # Возвращаем ответ Телеграму, что запрос принят и обработан (или попытка обработки была выполнена)
     logger.info("Returning 200 OK to Telegram")
     return Response(status=200)
 
