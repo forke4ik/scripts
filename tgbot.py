@@ -37,12 +37,12 @@ def create_application() -> Application:
 telegram_application = create_application()
 
 # Настраиваем Application для работы с webhook
-# Эти параметры нужны для внутренней настройки Application,
-# Gunicorn будет слушать порт, предоставленный Render.
+# Добавляем bootstrap_webhook=False, чтобы НЕ пытаться установить webhook при каждом запуске
 telegram_application.run_webhook(
-    listen='0.0.0.0',        # Слушаем на всех интерфейсах
-    port=8080,               # Произвольный порт (не используется Render напрямую)
-    url_path=WEBHOOK_PATH    # Используем путь webhook
+    listen='0.0.0.0',
+    port=8080,
+    url_path=WEBHOOK_PATH,
+    bootstrap_webhook=False # <-- ДОБАВЬ ЭТО
 )
 
 # Определяем переменную 'application', которую Gunicorn будет искать.
