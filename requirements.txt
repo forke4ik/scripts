@@ -1,7 +1,3 @@
 python-telegram-bot[webhooks]
 uvicorn
-python-telegram-bot
-uvicorn
-python-telegram-bot[webhooks]
-uvicorn
-Flask[async] # Устанавливаем Flask с поддержкой асинхронности
+Flask[async]
