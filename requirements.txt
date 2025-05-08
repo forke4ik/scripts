@@ -4,4 +4,4 @@ python-telegram-bot
 gunicorn
 python-telegram-bot[webhooks]
 gunicorn
-Flask # Добавляем Flask
+Flask[async] # Устанавливаем Flask с поддержкой асинхронности
