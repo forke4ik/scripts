@@ -1,107 +1,92 @@
 import logging
 import os
-# НЕ НУЖНО import asyncio, Flask обрабатывает асинхронность иначе
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask, request, Response # Импортируем Flask
+from flask import Flask, request, Response
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
 
 # Замени на ссылку на твой закрытый канал
 CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
-# WEBHOOK_PATH оставим для консистентности
 WEBHOOK_PATH = "webhook"
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO # Можно поставить DEBUG для еще больше деталей
 )
+logger = logging.getLogger(__name__) # Получаем логгер для этого модуля
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /start и отправляет ссылку."""
+    logger.info(f"Received /start command from user {update.effective_user.id}") # Лог: Получена команда /start
     user = update.effective_user
-    await update.message.reply_html(
-        f"Привет, {user.mention_html()}! Держи ссылку на наш закрытый канал:\n{CHANNEL_LINK}"
-    )
+    try:
+        await update.message.reply_html(
+            f"Привет, {user.mention_html()}! Держи ссылку на наш закрытый канал:\n{CHANNEL_LINK}"
+        )
+        logger.info(f"Sent /start response to user {user.id}") # Лог: Ответ отправлен
+    except Exception as e:
+        logger.error(f"Error sending /start response to user {user.id}: {e}") # Лог: Ошибка при отправке ответа
+        # Можно добавить отправку сообщения об ошибке себе в Телеграм для отладки
 
 # --- Настройка объекта Application из python-telegram-bot ---
 # Создаем и конфигурируем объект Application
 if not TOKEN:
-    logging.error("Error: Bot TOKEN not found in environment variables!")
+    logger.error("Error: Bot TOKEN not found in environment variables!")
     raise ValueError("Bot TOKEN not set")
 
-# Создаем объект Application
-# Здесь мы НЕ вызываем run_webhook() или run_polling().
-# Application будет использоваться Flask'ом для обработки входящих обновлений.
+logger.info("Creating Application object...") # Лог: Создаем Application
 telegram_application = Application.builder().token(TOKEN).build()
+logger.info("Application object created.") # Лог: Application создан
+
 # Добавляем обработчики команд
+logger.info("Adding command handlers...") # Лог: Добавляем обработчики
 telegram_application.add_handler(CommandHandler("start", start))
+logger.info("Command handlers added.") # Лог: Обработчики добавлены
 
 # --- Настройка Flask приложения ---
-# Создаем экземпляр Flask приложения
 app = Flask(__name__)
+logger.info("Flask app created.") # Лог: Flask создан
 
-# Определяем маршрут для webhook.
-# Телеграм будет отправлять POST-запросы на URL твоего сервиса Render + '/webhook'.
 @app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
 async def telegram_webhook_handler():
     """Обрабатывает входящие запросы от Телеграма."""
-    # Получаем JSON данные из запроса
+    logger.info("Received POST request on /webhook") # Лог: Получен POST запрос
+
     update_json = request.get_json()
-    # Проверяем, что данные пришли
     if not update_json:
-        logging.warning("Received empty webhook request")
+        logger.warning("Received empty webhook request")
         return Response(status=400)
 
-    # Создаем объект Update из JSON данных
-    update = Update.de_json(update_json, telegram_application.bot)
+    logger.info("Received update JSON, attempting to parse...") # Лог: Парсим JSON
+    try:
+        update = Update.de_json(update_json, telegram_application.bot)
+        logger.info(f"Update parsed: {update.update_id}") # Лог: Update распарсен
+    except Exception as e:
+         logger.error(f"Error parsing update JSON: {e}") # Лог: Ошибка парсинга
+         return Response(status=400)
 
-    # Обрабатываем обновление с помощью Application из python-telegram-bot
-    # Используем process_update для обработки обновления в асинхронном цикле Application
-    # await telegram_application.process_update(update) # process_update - асинхронный
 
-    # Flask требует синхронный ответ для простого роута.
-    # Вызов process_update нужно выполнить в асинхронном контексте.
-    # Можно использовать asyncio.run(), но это может быть проблематично в WSGI.
-    # Лучше передать обработку в Application другим способом или использовать ASGI-сервер (Uvicorn).
-    # Однако, для простоты, let's try just calling process_update directly if it works asyncly...
-    # No, process_update is a coroutine, needs await.
+    # Обновление помещается в очередь Application для обработки
+    # Application должен сам запустить обработку этого обновления в своем фоне
+    logger.info(f"Putting update {update.update_id} into update queue...") # Лог: Добавляем в очередь
+    try:
+        await telegram_application.update_queue.put(update)
+        logger.info(f"Update {update.update_id} successfully added to queue.") # Лог: Добавлено
+    except Exception as e:
+         logger.error(f"Error putting update {update.update_id} into queue: {e}") # Лог: Ошибка очереди
 
-    # Стандартный способ в Flask+PTB - использовать Application.update_queue
-    # или Dispatcher, но с PTB v22 Application сам диспатчер.
-    # В вебхуке нужно передать update в application.
-    # https://docs.python-telegram-bot.org/en/stable/telegram.ext.application.html#telegram.ext.Application.process_update
-    # process_update needs to be awaited.
 
-    # Option 1: Use a separate async function and run it (can have issues in WSGI)
-    # async def process_and_respond():
-    #     await telegram_application.process_update(update)
-    # asyncio.run(process_and_respond()) # This is bad in WSGI
-
-    # Option 2: Let PTB handle async within the Flask route (might not work directly)
-    # await telegram_application.process_update(update) # Flask needs async setup
-
-    # Correct approach for Flask/WSGI: Application.update_queue
-    # Add the update to the application's update queue
-    await telegram_application.update_queue.put(update) # Add update to internal queue
-
-    # Возвращаем ответ Телеграму, что запрос принят
+    # Возвращаем ответ Телеграму
+    logger.info("Returning 200 OK to Telegram") # Лог: Возвращаем 200
     return Response(status=200)
 
 # --- ТО, ЧТО НУЖНО GUNICORN ---
 # Gunicorn будет искать переменную 'application' на верхнем уровне.
 # Мы предоставляем Flask приложение.
 application = app
+logger.info("WSGI application variable set to Flask app.") # Лог: WSGI приложение готово
 # --- КОНЕЦ ТОГО, ЧТО НУЖНО GUNICORN ---
 
-# --- Этот блок не нужен для работы с Render/Gunicorn/Flask ---
-# run_polling() и run_webhook() не используются.
-# if __name__ == "__main__":
-#     # Этот блок только для локального запуска Flask приложения (для тестирования)
-#     # Не используется Render/Gunicorn
-#     # Убедись, что у тебя установлен Flask: pip install Flask
-#     # Убедись, что токен бота установлен как переменная окружения
-#     if not TOKEN:
-#         logging.error("Error: Bot TOKEN not found for local testing!")
-#     # Flask будет слушать на порту 5000 по умолчанию
-#     app.run(debug=True) # debug=True только для разработки
+# --- Блок для ручной установки webhook ОСТАЕТСЯ ЗАКОММЕНТИРОВАННЫМ ---
+# ... (код из предыдущего примера)
