@@ -93,6 +93,33 @@ async def telegram_webhook_handler():
     logger.info("Returning 200 OK to Telegram")
     return Response(status=200)
 
+# Добавляем обработчик для корневого пути
+@app.route("/", methods=["GET"])
+async def health_check():
+    """Проверка состояния сервера."""
+    return {"status": "Bot is running", "webhook_url": f"/{WEBHOOK_PATH}"}
+
+# Добавляем маршрут для установки webhook
+@app.route("/set_webhook", methods=["GET"])
+async def set_webhook():
+    """Устанавливает webhook для бота."""
+    webhook_url = "https://my-telegram-webhook-bot.onrender.com/webhook"
+    
+    try:
+        # Инициализируем Application если нужно
+        global is_application_initialized
+        if not is_application_initialized:
+            await telegram_application.initialize()
+            is_application_initialized = True
+        
+        # Устанавливаем webhook
+        await telegram_application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+        return {"status": "success", "webhook_url": webhook_url}
+    except Exception as e:
+        logger.error(f"Error setting webhook: {e}")
+        return {"status": "error", "error": str(e)}
+
 # --- Для uvicorn ---
 # app уже определен как Quart приложение, которое является ASGI совместимым
 
