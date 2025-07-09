@@ -1,4 +1,3 @@
-+ gunicorn
-  python-telegram-bot[webhooks]
-  uvicorn
-  Flask[async]
+python-telegram-bot[webhooks]
+uvicorn
+Flask[async]
