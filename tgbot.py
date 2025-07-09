@@ -7,7 +7,7 @@ from flask import Flask, request, Response
 # import asyncio
 
 # TOKEN из переменных окружения Render
-TOKEN = os.environ.get("TOKEN")
+TOKEN = "8040453883:AAGRRWGDOCMFipxpFfkGmG2HrRJZ9jYtOzg"
 
 # Замени на ссылку на твой закрытый канал
 CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
