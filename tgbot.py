@@ -1,7 +1,7 @@
-#import logging
-#import os
-#from telegram import Update
-#from telegram.ext import Application, CommandHandler, ContextTypes
+import logging
+import os
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, request, Response
 # asyncio не нужен, Flask async views справляются
 # import asyncio
