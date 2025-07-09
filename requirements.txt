@@ -1,3 +1,5 @@
 python-telegram-bot[webhooks]
 uvicorn
 quart
+aiohttp
+requests
