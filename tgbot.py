@@ -1,9 +1,11 @@
 import logging
 import os
+import asyncio
+import aiohttp
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from quart import Quart, request, Response
-import asyncio
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
@@ -12,10 +14,17 @@ TOKEN = os.environ.get("TOKEN")
 CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
 WEBHOOK_PATH = "webhook"
 
+# URL для самопинга (замените на ваш актуальный URL)
+SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
+PING_INTERVAL = 600  # 10 минут
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Глобальная переменная для задачи пинга
+ping_task = None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /start и отправляет ссылку."""
@@ -29,6 +38,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"Error sending /start response to user {user.id}: {e}")
 
+async def self_ping():
+    """Функция для самопинга сервера"""
+    while True:
+        try:
+            await asyncio.sleep(PING_INTERVAL)
+            
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                logger.info(f"📡 Отправляем самопинг в {timestamp}")
+                
+                async with session.get(f"{SELF_PING_URL}/") as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        logger.info(f"✅ Самопинг успешен: {data.get('status', 'OK')}")
+                    else:
+                        logger.warning(f"⚠️ Самопинг вернул статус {response.status}")
+                        
+        except asyncio.CancelledError:
+            logger.info("🛑 Самопинг остановлен")
+            break
+        except Exception as e:
+            logger.error(f"❌ Ошибка самопинга: {e}")
+            # Продолжаем работу даже при ошибке
 
 # --- Настройка объекта Application из python-telegram-bot ---
 if not TOKEN:
@@ -49,6 +82,25 @@ logger.info("Quart app created.")
 
 # Флаг для отслеживания инициализации Application
 is_application_initialized = False
+
+@app.before_serving
+async def startup():
+    """Запускается при старте приложения"""
+    global ping_task
+    logger.info("🚀 Запуск самопинга...")
+    ping_task = asyncio.create_task(self_ping())
+
+@app.after_serving
+async def shutdown():
+    """Запускается при остановке приложения"""
+    global ping_task
+    if ping_task:
+        logger.info("🛑 Остановка самопинга...")
+        ping_task.cancel()
+        try:
+            await ping_task
+        except asyncio.CancelledError:
+            pass
 
 @app.route(f"/{WEBHOOK_PATH}", methods=["POST"])
 async def telegram_webhook_handler():
@@ -97,13 +149,18 @@ async def telegram_webhook_handler():
 @app.route("/", methods=["GET"])
 async def health_check():
     """Проверка состояния сервера."""
-    return {"status": "Bot is running", "webhook_url": f"/{WEBHOOK_PATH}"}
+    return {
+        "status": "Bot is running", 
+        "webhook_url": f"/{WEBHOOK_PATH}",
+        "ping_status": "active" if ping_task and not ping_task.done() else "inactive",
+        "timestamp": datetime.now().isoformat()
+    }
 
 # Добавляем маршрут для установки webhook
 @app.route("/set_webhook", methods=["GET"])
 async def set_webhook():
     """Устанавливает webhook для бота."""
-    webhook_url = "https://my-telegram-webhook-bot.onrender.com/webhook"
+    webhook_url = f"{SELF_PING_URL}/webhook"
     
     try:
         # Инициализируем Application если нужно
@@ -119,6 +176,17 @@ async def set_webhook():
     except Exception as e:
         logger.error(f"Error setting webhook: {e}")
         return {"status": "error", "error": str(e)}
+
+# Добавляем маршрут для проверки статуса пинга
+@app.route("/ping_status", methods=["GET"])
+async def ping_status():
+    """Возвращает статус пинга"""
+    return {
+        "ping_active": ping_task and not ping_task.done(),
+        "ping_interval": PING_INTERVAL,
+        "self_ping_url": SELF_PING_URL,
+        "timestamp": datetime.now().isoformat()
+    }
 
 # --- Для uvicorn ---
 # app уже определен как Quart приложение, которое является ASGI совместимым
