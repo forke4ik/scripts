@@ -5,7 +5,7 @@ import aiohttp
 import json
 from datetime import datetime
 from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from quart import Quart, request, Response
 
@@ -59,6 +59,16 @@ def save_stats(stats):
 # Инициализация статистики
 stats = load_stats()
 
+async def setup_menu(application: Application):
+    """Устанавливает меню команд в боте"""
+    commands = [
+        BotCommand("start", "Начать работу с ботом"),
+        BotCommand("help", "Помощь по использованию бота"),
+        BotCommand("channel", "Получить ссылку на канал"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Меню команд установлено")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /start и отправляет ссылку с клавиатурой."""
     global stats
@@ -79,7 +89,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         }
         save_stats(stats)
     
-    # Создаем клавиатуру с кнопкой (ИСПРАВЛЕНА ОШИБКА СИНТАКСИСА)
+    # Создаем клавиатуру с кнопкой
     keyboard = [
         [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
     ]
@@ -87,12 +97,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     try:
         await update.message.reply_html(
-            f"Привет, {user.mention_html()}! Нажми кнопку ниже, чтобы перейти в наш закрытый канал.",
+            f"Привет, {user.mention_html()}! Я помогу тебе получить доступ к нашему закрытому каналу.",
             reply_markup=reply_markup
         )
         logger.info(f"Sent /start response to user {user.id}")
     except Exception as e:
         logger.error(f"Error sending /start response to user {user.id}: {e}")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает команду /help"""
+    help_text = (
+        "🤖 <b>Команды бота:</b>\n\n"
+        "/start - Начать работу с ботом\n"
+        "/help - Показать эту справку\n"
+        "/channel - Получить ссылку на канал\n"
+        "\n"
+        "Просто нажми на кнопку <b>«Зайти в канал»</b>, чтобы присоединиться к нашему сообществу!"
+    )
+    await update.message.reply_html(help_text)
+
+async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает команду /channel"""
+    keyboard = [
+        [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "Нажми кнопку ниже, чтобы перейти в наш закрытый канал:",
+        reply_markup=reply_markup
+    )
 
 async def track_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отслеживает нажатия на кнопку (для статистики)"""
@@ -123,15 +157,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     global stats
     message = (
-        f"📊 Статистика бота:\n"
-        f"👤 Всего пользователей: {stats['total_users']}\n"
-        f"🖱️ Переходов по ссылке: {stats['link_clicks']}\n"
+        f"📊 <b>Статистика бота:</b>\n\n"
+        f"👤 Всего пользователей: <b>{stats['total_users']}</b>\n"
+        f"🖱️ Переходов по ссылке: <b>{stats['link_clicks']}</b>\n"
         f"🕒 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     
     try:
         # Отправляем текстовую статистику
-        await update.message.reply_text(message)
+        await update.message.reply_html(message)
         
         # Отправляем файл с полной статистикой
         with open(STATS_FILE, 'rb') as f:
@@ -180,6 +214,8 @@ logger.info("Application object created.")
 
 logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
+telegram_application.add_handler(CommandHandler("help", help_command))
+telegram_application.add_handler(CommandHandler("channel", channel_command))
 telegram_application.add_handler(CommandHandler("stats", stats_command))
 telegram_application.add_handler(CallbackQueryHandler(track_link_click))
 logger.info("Command handlers added.")
@@ -197,6 +233,10 @@ async def startup():
     global ping_task
     logger.info("🚀 Запуск самопинга...")
     ping_task = asyncio.create_task(self_ping())
+    
+    # Устанавливаем меню команд
+    logger.info("Устанавливаем меню команд...")
+    await setup_menu(telegram_application)
 
 @app.after_serving
 async def shutdown():
