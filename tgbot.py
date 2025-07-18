@@ -25,7 +25,8 @@ PING_INTERVAL = 600  # 10 минут
 STATS_FILE = "stats.json"
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def load_stats():
     """Загружает статистику из файла"""
     try:
         if Path(STATS_FILE).exists():
-            with open(STATS_FILE, 'r') as f:
+            with open(STATS_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except Exception as e:
         logger.error(f"Error loading stats: {e}")
@@ -50,8 +51,8 @@ def load_stats():
 def save_stats(stats):
     """Сохраняет статистику в файл"""
     try:
-        with open(STATS_FILE, 'w') as f:
-            json.dump(stats, f, indent=2)
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error saving stats: {e}")
 
@@ -76,11 +77,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "start_time": datetime.now().isoformat(),
             "link_clicks": 0
         }
-    save_stats(stats)
+        save_stats(stats)
     
-    # Создаем клавиатуру с кнопкой
+    # Создаем клавиатуру с кнопкой (ИСПРАВЛЕНА ОШИБКА СИНТАКСИСА)
     keyboard = [
         [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     try:
@@ -92,11 +94,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.error(f"Error sending /start response to user {user.id}: {e}")
 
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает нажатие на кнопку (для будущего использования)"""
+async def track_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отслеживает нажатия на кнопку (для статистики)"""
     query = update.callback_query
     await query.answer()
     logger.info(f"Button clicked by user {query.from_user.id}")
+    
+    # Обновляем статистику переходов
+    user_id_str = str(query.from_user.id)
+    global stats
+    
+    if user_id_str in stats['users']:
+        stats['users'][user_id_str]['link_clicks'] += 1
+        stats['link_clicks'] += 1
+        save_stats(stats)
+        logger.info(f"Updated link click stats for user {query.from_user.id}")
+    else:
+        logger.warning(f"User {query.from_user.id} clicked but not in stats")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет статистику создателю бота"""
@@ -167,7 +181,7 @@ logger.info("Application object created.")
 logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
 telegram_application.add_handler(CommandHandler("stats", stats_command))
-telegram_application.add_handler(CallbackQueryHandler(button_click))
+telegram_application.add_handler(CallbackQueryHandler(track_link_click))
 logger.info("Command handlers added.")
 
 # --- Настройка Quart приложения (ASGI совместимый) ---
