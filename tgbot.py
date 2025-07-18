@@ -2,13 +2,16 @@ import logging
 import os
 import asyncio
 import aiohttp
+import json
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from quart import Quart, request, Response
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
+CREATOR_ID = 7106925462  # ID создателя бота
 
 # Замени на ссылку на твой закрытый канал
 CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
@@ -18,6 +21,9 @@ WEBHOOK_PATH = "webhook"
 SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
 PING_INTERVAL = 600  # 10 минут
 
+# Путь к файлу статистики
+STATS_FILE = "stats.json"
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
@@ -26,17 +32,104 @@ logger = logging.getLogger(__name__)
 # Глобальная переменная для задачи пинга
 ping_task = None
 
+# --- Система статистики ---
+def load_stats():
+    """Загружает статистику из файла"""
+    try:
+        if Path(STATS_FILE).exists():
+            with open(STATS_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading stats: {e}")
+    return {
+        "total_users": 0,
+        "link_clicks": 0,
+        "users": {}
+    }
+
+def save_stats(stats):
+    """Сохраняет статистику в файл"""
+    try:
+        with open(STATS_FILE, 'w') as f:
+            json.dump(stats, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving stats: {e}")
+
+# Инициализация статистики
+stats = load_stats()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает команду /start и отправляет ссылку."""
-    logger.info(f"Received /start command from user {update.effective_user.id}")
+    """Обрабатывает команду /start и отправляет ссылку с клавиатурой."""
+    global stats
     user = update.effective_user
+    logger.info(f"Received /start command from user {user.id}")
+    
+    # Обновляем статистику
+    user_id_str = str(user.id)
+    if user_id_str not in stats['users']:
+        stats['total_users'] += 1
+        stats['users'][user_id_str] = {
+            "id": user.id,
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "start_time": datetime.now().isoformat(),
+            "link_clicks": 0
+        }
+    save_stats(stats)
+    
+    # Создаем клавиатуру с кнопкой
+    keyboard = [
+        [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     try:
         await update.message.reply_html(
-            f"Привет, {user.mention_html()}! Держи ссылку на наш закрытый канал:\n{CHANNEL_LINK}"
+            f"Привет, {user.mention_html()}! Нажми кнопку ниже, чтобы перейти в наш закрытый канал.",
+            reply_markup=reply_markup
         )
         logger.info(f"Sent /start response to user {user.id}")
     except Exception as e:
         logger.error(f"Error sending /start response to user {user.id}: {e}")
+
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает нажатие на кнопку (для будущего использования)"""
+    query = update.callback_query
+    await query.answer()
+    logger.info(f"Button clicked by user {query.from_user.id}")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отправляет статистику создателю бота"""
+    user = update.effective_user
+    
+    # Проверяем права доступа
+    if user.id != CREATOR_ID:
+        await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
+        return
+    
+    global stats
+    message = (
+        f"📊 Статистика бота:\n"
+        f"👤 Всего пользователей: {stats['total_users']}\n"
+        f"🖱️ Переходов по ссылке: {stats['link_clicks']}\n"
+        f"🕒 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    
+    try:
+        # Отправляем текстовую статистику
+        await update.message.reply_text(message)
+        
+        # Отправляем файл с полной статистикой
+        with open(STATS_FILE, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename='bot_stats.json',
+                caption="Полная статистика в JSON"
+            )
+        logger.info(f"Sent stats to creator {user.id}")
+    except Exception as e:
+        logger.error(f"Error sending stats: {e}")
+        await update.message.reply_text(f"Ошибка при формировании статистики: {e}")
 
 async def self_ping():
     """Функция для самопинга сервера"""
@@ -61,7 +154,6 @@ async def self_ping():
             break
         except Exception as e:
             logger.error(f"❌ Ошибка самопинга: {e}")
-            # Продолжаем работу даже при ошибке
 
 # --- Настройка объекта Application из python-telegram-bot ---
 if not TOKEN:
@@ -74,6 +166,8 @@ logger.info("Application object created.")
 
 logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
+telegram_application.add_handler(CommandHandler("stats", stats_command))
+telegram_application.add_handler(CallbackQueryHandler(button_click))
 logger.info("Command handlers added.")
 
 # --- Настройка Quart приложения (ASGI совместимый) ---
@@ -153,7 +247,11 @@ async def health_check():
         "status": "Bot is running", 
         "webhook_url": f"/{WEBHOOK_PATH}",
         "ping_status": "active" if ping_task and not ping_task.done() else "inactive",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "stats": {
+            "total_users": stats['total_users'],
+            "link_clicks": stats['link_clicks']
+        }
     }
 
 # Добавляем маршрут для установки webhook
