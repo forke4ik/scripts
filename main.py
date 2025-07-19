@@ -61,6 +61,7 @@ async def create_tables():
                 first_name TEXT,
                 last_name TEXT,
                 country_code TEXT,
+                device_type TEXT,
                 start_time TIMESTAMP DEFAULT NOW()
             );
             
@@ -68,7 +69,6 @@ async def create_tables():
                 event_id SERIAL PRIMARY KEY,
                 user_id BIGINT REFERENCES users(user_id),
                 event_type TEXT,
-                device_type TEXT,
                 event_time TIMESTAMP DEFAULT NOW()
             );
             
@@ -85,7 +85,7 @@ async def create_tables():
             ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
         ''')
         await conn.execute('''
-            ALTER TABLE events ADD COLUMN IF NOT EXISTS device_type TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS device_type TEXT;
         ''')
         
         logger.info("✅ Таблицы в базе данных созданы/проверены")
@@ -113,32 +113,33 @@ async def clean_old_data():
     except Exception as e:
         logger.error(f"❌ Ошибка очистки старых данных: {e}")
 
-async def save_user(user, country_code=None):
-    """Сохраняет пользователя в базу данных"""
+async def save_user(user, country_code=None, device_type=None):
+    """Сохраняет или обновляет пользователя в базе данных"""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         await conn.execute('''
-            INSERT INTO users (user_id, username, first_name, last_name, country_code)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO users (user_id, username, first_name, last_name, country_code, device_type)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (user_id) DO UPDATE SET
                 username = EXCLUDED.username,
                 first_name = EXCLUDED.first_name,
                 last_name = EXCLUDED.last_name,
-                country_code = EXCLUDED.country_code
-        ''', user.id, user.username, user.first_name, user.last_name, country_code)
+                country_code = COALESCE(EXCLUDED.country_code, users.country_code),
+                device_type = COALESCE(EXCLUDED.device_type, users.device_type)
+        ''', user.id, user.username, user.first_name, user.last_name, country_code, device_type)
         await conn.close()
-        logger.info(f"👤 Пользователь {user.id} сохранен в БД")
+        logger.info(f"👤 Пользователь {user.id} сохранен/обновлен в БД")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения пользователя {user.id}: {e}")
 
-async def log_event(user_id, event_type, device_type=None):
+async def log_event(user_id, event_type):
     """Логирует событие в базе данных"""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         await conn.execute('''
-            INSERT INTO events (user_id, event_type, device_type)
-            VALUES ($1, $2, $3)
-        ''', user_id, event_type, device_type)
+            INSERT INTO events (user_id, event_type)
+            VALUES ($1, $2)
+        ''', user_id, event_type)
         await conn.close()
         logger.info(f"📝 Событие '{event_type}' для {user_id} записано в БД")
     except Exception as e:
@@ -172,27 +173,29 @@ async def is_user_joined(user_id):
         return False
 
 async def get_basic_stats():
-    """Возвращает базовую статистику (только за последнюю неделю)"""
+    """Возвращает базовую статистику"""
     stats = {
         "total_users": 0,
-        "link_clicks": 0,
-        "channel_joins": 0
+        "active_users_week": 0,
+        "channel_joins_week": 0
     }
     try:
         one_week_ago = datetime.now() - timedelta(days=7)
         
         conn = await asyncpg.connect(DATABASE_URL)
         
-        # Общее количество пользователей (без ограничения по времени)
+        # Общее количество пользователей
         stats['total_users'] = await conn.fetchval('SELECT COUNT(*) FROM users')
         
-        # Статистика за последнюю неделю
-        stats['link_clicks'] = await conn.fetchval(
-            "SELECT COUNT(*) FROM events "
-            "WHERE event_type = 'link_click' AND event_time >= $1",
+        # Активные пользователи за неделю
+        stats['active_users_week'] = await conn.fetchval(
+            "SELECT COUNT(DISTINCT user_id) FROM events "
+            "WHERE event_time >= $1",
             one_week_ago
         )
-        stats['channel_joins'] = await conn.fetchval(
+        
+        # Вступления в канал за неделю
+        stats['channel_joins_week'] = await conn.fetchval(
             "SELECT COUNT(*) FROM channel_joins "
             "WHERE join_time >= $1",
             one_week_ago
@@ -204,99 +207,84 @@ async def get_basic_stats():
     return stats
 
 async def get_geo_stats():
-    """Возвращает статистику по странам (за последнюю неделю)"""
+    """Возвращает статистику по странам (уникальные пользователи)"""
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
-        
         conn = await asyncpg.connect(DATABASE_URL)
         result = await conn.fetch('''
-            SELECT u.country_code, COUNT(*) AS count
-            FROM users u
-            JOIN events e ON u.user_id = e.user_id
-            WHERE u.country_code IS NOT NULL AND e.event_time >= $1
-            GROUP BY u.country_code
-            ORDER BY count DESC
-        ''', one_week_ago)
-        
+            SELECT country_code, COUNT(*) AS user_count
+            FROM users
+            WHERE country_code IS NOT NULL
+            GROUP BY country_code
+            ORDER BY user_count DESC
+        ''')
         await conn.close()
-        return {row['country_code']: row['count'] for row in result}
+        return {row['country_code']: row['user_count'] for row in result}
     except Exception as e:
         logger.error(f"❌ Ошибка получения гео-статистики: {e}")
         return {}
 
 async def get_device_stats():
-    """Возвращает статистику по устройствам (за последнюю неделю)"""
+    """Возвращает статистику по устройствам (уникальные пользователи)"""
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
-        
         conn = await asyncpg.connect(DATABASE_URL)
         result = await conn.fetch('''
-            SELECT device_type, COUNT(*) AS count
-            FROM events
-            WHERE device_type IS NOT NULL AND event_time >= $1
+            SELECT device_type, COUNT(*) AS user_count
+            FROM users
+            WHERE device_type IS NOT NULL
             GROUP BY device_type
-            ORDER BY count DESC
-        ''', one_week_ago)
-        
+            ORDER BY user_count DESC
+        ''')
         await conn.close()
-        return {row['device_type']: row['count'] for row in result}
+        return {row['device_type']: row['user_count'] for row in result}
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики устройств: {e}")
         return {}
 
 async def get_time_stats():
-    """Возвращает статистику по времени активности (за последнюю неделю)"""
+    """Возвращает статистику по времени активности (уникальные пользователи)"""
     try:
         one_week_ago = datetime.now() - timedelta(days=7)
+        local_tz = pytz.timezone('Europe/Moscow')  # Замените на нужный часовой пояс
         
         conn = await asyncpg.connect(DATABASE_URL)
         
-        # Статистика по часам
+        # Статистика по часам (в локальном времени)
         hourly_stats = await conn.fetch('''
-            SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC') AS hour, COUNT(*) AS count
+            SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE $1) AS hour, 
+                   COUNT(DISTINCT user_id) AS user_count
             FROM events
-            WHERE event_time >= $1
+            WHERE event_time >= $2
             GROUP BY hour
             ORDER BY hour
-        ''', one_week_ago)
+        ''', local_tz.zone, one_week_ago)
         
-        # Статистика по дням недели
+        # Статистика по дням недели (в локальном времени)
         daily_stats = await conn.fetch('''
-            SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
+            SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE $1) AS day, 
+                   COUNT(DISTINCT user_id) AS user_count
             FROM events
-            WHERE event_time >= $1
+            WHERE event_time >= $2
             GROUP BY day
             ORDER BY day
-        ''', one_week_ago)
+        ''', local_tz.zone, one_week_ago)
         
         await conn.close()
         
         return {
-            "hourly": {int(row['hour']): row['count'] for row in hourly_stats},
-            "daily": {int(row['day']): row['count'] for row in daily_stats}
+            "hourly": {int(row['hour']): row['user_count'] for row in hourly_stats},
+            "daily": {int(row['day']): row['user_count'] for row in daily_stats}
         }
     except Exception as e:
         logger.error(f"❌ Ошибка получения временной статистики: {e}")
         return {"hourly": {}, "daily": {}}
 
 async def get_full_stats():
-    """Возвращает полную статистику для экспорта (только за последнюю неделю)"""
+    """Возвращает полную статистику для экспорта"""
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
-        
         conn = await asyncpg.connect(DATABASE_URL)
-        
-        # Получаем только актуальные данные
         users = await conn.fetch("SELECT * FROM users")
-        events = await conn.fetch(
-            "SELECT * FROM events WHERE event_time >= $1",
-            one_week_ago
-        )
-        joins = await conn.fetch(
-            "SELECT * FROM channel_joins WHERE join_time >= $1",
-            one_week_ago
-        )
-        
+        events = await conn.fetch("SELECT * FROM events")
+        joins = await conn.fetch("SELECT * FROM channel_joins")
         await conn.close()
         
         return {
@@ -331,9 +319,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     
     device_type = "mobile" if update.effective_message and update.effective_message.via_bot else "desktop"
     
-    # Сохраняем пользователя в БД
-    await save_user(user, country_code)
-    await log_event(user.id, 'start', device_type)
+    # Сохраняем/обновляем пользователя в БД
+    await save_user(user, country_code, device_type)
+    await log_event(user.id, 'start')
     
     # Создаем клавиатуру с кнопками
     keyboard = [
@@ -398,7 +386,10 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Определяем устройство
     device_type = "mobile" if message and message.via_bot else "desktop"
-    await log_event(user.id, 'subscription_check', device_type)
+    
+    # Обновляем информацию об устройстве пользователя
+    await save_user(user, device_type=device_type)
+    await log_event(user.id, 'subscription_check')
     
     try:
         # Проверяем подписку
@@ -408,7 +399,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if is_member:
             # Логируем вступление
             await log_channel_join(user.id)
-            await log_event(user.id, 'channel_join', device_type)
+            await log_event(user.id, 'channel_join')
             
             # Отправляем сообщение с предложением поделиться ссылкой
             response_text = (
@@ -453,7 +444,6 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
     
     except Forbidden as e:
-        # Обработка ошибки "bot is not a member" или недостаточных прав
         logger.error(f"Ошибка проверки подписки: {e}")
         error_text = (
             "⚠️ Недостаточно прав для проверки подписки.\n\n"
@@ -467,7 +457,6 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await message.reply_text(error_text)
     
     except BadRequest as e:
-        # Обработка неправильного CHANNEL_ID
         logger.error(f"Ошибка проверки подписки: {e}")
         error_text = "⚠️ Ошибка конфигурации бота. Пожалуйста, сообщите администратору."
         if query:
@@ -515,18 +504,21 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Дни недели для удобства
     weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     
+    # Локальное время для отображения
+    local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     message = (
-        f"📊 <b>Статистика бота (за последнюю неделю)</b>\n\n"
+        f"📊 <b>Статистика бота</b>\n\n"
         f"👤 <u>Пользователи</u>\n"
         f"  Всего: <b>{basic_stats['total_users']}</b>\n"
-        f"  Подписались на канал: <b>{basic_stats['channel_joins']}</b>\n"
-        f"  Переходов по ссылке: <b>{basic_stats['link_clicks']}</b>\n\n"
-        f"🗺️ <u>География</u>\n{geo_text}\n\n"
-        f"📱 <u>Устройства</u>\n{device_text}\n\n"
-        f"⏱ <u>Активность</u>\n"
-        f"  Пиковый час: <b>{int(peak_hour[0])}:00</b> ({peak_hour[1]} действий)\n"
-        f"  Самый активный день: <b>{weekdays[int(peak_day[0])]}</b> ({peak_day[1]} действий)\n\n"
-        f"🕒 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"  Активных за неделю: <b>{basic_stats['active_users_week']}</b>\n"
+        f"  Подписались на канал: <b>{basic_stats['channel_joins_week']}</b>\n\n"
+        f"🗺️ <u>География (уникальные пользователи)</u>\n{geo_text}\n\n"
+        f"📱 <u>Устройства (уникальные пользователи)</u>\n{device_text}\n\n"
+        f"⏱ <u>Активность (уникальные пользователи)</u>\n"
+        f"  Пиковый час: <b>{int(peak_hour[0])}:00</b> ({peak_hour[1]} пользователей)\n"
+        f"  Самый активный день: <b>{weekdays[int(peak_day[0])]}</b> ({peak_day[1]} пользователей)\n\n"
+        f"🕒 Последнее обновление: {local_time}"
     )
     
     try:
@@ -538,7 +530,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_document(
             document=BytesIO(stats_json.encode('utf-8')),
             filename='bot_stats.json',
-            caption="Статистика за последнюю неделю"
+            caption="Полная статистика"
         )
         logger.info(f"Sent stats to creator {user.id}")
     except Exception as e:
@@ -719,8 +711,8 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "stats": {
             "total_users": stats.get('total_users', 0),
-            "channel_joins": stats.get('channel_joins', 0),
-            "link_clicks": stats.get('link_clicks', 0),
+            "active_users_week": stats.get('active_users_week', 0),
+            "channel_joins_week": stats.get('channel_joins_week', 0),
             "countries": geo_stats,
             "devices": device_stats
         }
