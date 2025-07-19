@@ -4,7 +4,7 @@ import asyncio
 import aiohttp
 import json
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Глобальная переменная для задачи пинга
 ping_task = None
+cleanup_task = None  # Для периодической очистки данных
 
 # --- Функции для работы с базой данных Neon.tech ---
 async def create_tables():
@@ -92,6 +93,25 @@ async def create_tables():
     except Exception as e:
         logger.error(f"❌ Ошибка создания таблиц: {e}")
         raise
+
+async def clean_old_data():
+    """Очищает старые данные (старше 1 недели)"""
+    try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Удаляем старые события
+        await conn.execute('''
+            DELETE FROM events 
+            WHERE event_time < $1
+        ''', one_week_ago)
+        
+        logger.info(f"🧹 Очищены старые события (старше {one_week_ago})")
+        
+        await conn.close()
+    except Exception as e:
+        logger.error(f"❌ Ошибка очистки старых данных: {e}")
 
 async def save_user(user, country_code=None):
     """Сохраняет пользователя в базу данных"""
@@ -152,33 +172,52 @@ async def is_user_joined(user_id):
         return False
 
 async def get_basic_stats():
-    """Возвращает базовую статистику"""
+    """Возвращает базовую статистику (только за последнюю неделю)"""
     stats = {
         "total_users": 0,
         "link_clicks": 0,
         "channel_joins": 0
     }
     try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
         conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Общее количество пользователей (без ограничения по времени)
         stats['total_users'] = await conn.fetchval('SELECT COUNT(*) FROM users')
-        stats['link_clicks'] = await conn.fetchval("SELECT COUNT(*) FROM events WHERE event_type = 'link_click'")
-        stats['channel_joins'] = await conn.fetchval("SELECT COUNT(*) FROM channel_joins")
+        
+        # Статистика за последнюю неделю
+        stats['link_clicks'] = await conn.fetchval(
+            "SELECT COUNT(*) FROM events "
+            "WHERE event_type = 'link_click' AND event_time >= $1",
+            one_week_ago
+        )
+        stats['channel_joins'] = await conn.fetchval(
+            "SELECT COUNT(*) FROM channel_joins "
+            "WHERE join_time >= $1",
+            one_week_ago
+        )
+        
         await conn.close()
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
     return stats
 
 async def get_geo_stats():
-    """Возвращает статистику по странам"""
+    """Возвращает статистику по странам (за последнюю неделю)"""
     try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
         conn = await asyncpg.connect(DATABASE_URL)
         result = await conn.fetch('''
-            SELECT country_code, COUNT(*) AS count
-            FROM users
-            WHERE country_code IS NOT NULL
-            GROUP BY country_code
+            SELECT u.country_code, COUNT(*) AS count
+            FROM users u
+            JOIN events e ON u.user_id = e.user_id
+            WHERE u.country_code IS NOT NULL AND e.event_time >= $1
+            GROUP BY u.country_code
             ORDER BY count DESC
-        ''')
+        ''', one_week_ago)
+        
         await conn.close()
         return {row['country_code']: row['count'] for row in result}
     except Exception as e:
@@ -186,16 +225,19 @@ async def get_geo_stats():
         return {}
 
 async def get_device_stats():
-    """Возвращает статистику по устройствам"""
+    """Возвращает статистику по устройствам (за последнюю неделю)"""
     try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
         conn = await asyncpg.connect(DATABASE_URL)
         result = await conn.fetch('''
             SELECT device_type, COUNT(*) AS count
             FROM events
-            WHERE device_type IS NOT NULL
+            WHERE device_type IS NOT NULL AND event_time >= $1
             GROUP BY device_type
             ORDER BY count DESC
-        ''')
+        ''', one_week_ago)
+        
         await conn.close()
         return {row['device_type']: row['count'] for row in result}
     except Exception as e:
@@ -203,25 +245,29 @@ async def get_device_stats():
         return {}
 
 async def get_time_stats():
-    """Возвращает статистику по времени активности"""
+    """Возвращает статистику по времени активности (за последнюю неделю)"""
     try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
         conn = await asyncpg.connect(DATABASE_URL)
         
         # Статистика по часам
         hourly_stats = await conn.fetch('''
             SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC') AS hour, COUNT(*) AS count
             FROM events
+            WHERE event_time >= $1
             GROUP BY hour
             ORDER BY hour
-        ''')
+        ''', one_week_ago)
         
         # Статистика по дням недели
         daily_stats = await conn.fetch('''
             SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
             FROM events
+            WHERE event_time >= $1
             GROUP BY day
             ORDER BY day
-        ''')
+        ''', one_week_ago)
         
         await conn.close()
         
@@ -234,12 +280,23 @@ async def get_time_stats():
         return {"hourly": {}, "daily": {}}
 
 async def get_full_stats():
-    """Возвращает полную статистику для экспорта"""
+    """Возвращает полную статистику для экспорта (только за последнюю неделю)"""
     try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
         conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Получаем только актуальные данные
         users = await conn.fetch("SELECT * FROM users")
-        events = await conn.fetch("SELECT * FROM events")
-        joins = await conn.fetch("SELECT * FROM channel_joins")
+        events = await conn.fetch(
+            "SELECT * FROM events WHERE event_time >= $1",
+            one_week_ago
+        )
+        joins = await conn.fetch(
+            "SELECT * FROM channel_joins WHERE join_time >= $1",
+            one_week_ago
+        )
+        
         await conn.close()
         
         return {
@@ -353,11 +410,12 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await log_channel_join(user.id)
             await log_event(user.id, 'channel_join', device_type)
             
-            # Отправляем приветствие и ссылку
+            # Отправляем сообщение с предложением поделиться ссылкой
             response_text = (
                 f"🎉 Отлично, {user.mention_html()}! Ты подписан на наш канал.\n\n"
-                "Теперь ты можешь перейти в канал по этой ссылке:\n"
-                f"👉 {CHANNEL_LINK}"
+                "Можешь поделиться ссылкой с друзьями:\n"
+                f"👉 {CHANNEL_LINK}\n\n"
+                "Приглашай друзей - вместе интереснее!"
             )
             
             # Обновляем сообщение с кнопкой
@@ -458,7 +516,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     
     message = (
-        f"📊 <b>Расширенная статистика бота</b>\n\n"
+        f"📊 <b>Статистика бота (за последнюю неделю)</b>\n\n"
         f"👤 <u>Пользователи</u>\n"
         f"  Всего: <b>{basic_stats['total_users']}</b>\n"
         f"  Подписались на канал: <b>{basic_stats['channel_joins']}</b>\n"
@@ -480,7 +538,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_document(
             document=BytesIO(stats_json.encode('utf-8')),
             filename='bot_stats.json',
-            caption="Полная статистика в JSON"
+            caption="Статистика за последнюю неделю"
         )
         logger.info(f"Sent stats to creator {user.id}")
     except Exception as e:
@@ -511,6 +569,19 @@ async def self_ping():
         except Exception as e:
             logger.error(f"❌ Ошибка самопинга: {e}")
 
+async def periodic_cleanup():
+    """Периодическая очистка старых данных"""
+    while True:
+        try:
+            # Очищаем раз в день
+            await asyncio.sleep(24 * 60 * 60)  # 24 часа
+            await clean_old_data()
+        except asyncio.CancelledError:
+            logger.info("🛑 Очистка данных остановлена")
+            break
+        except Exception as e:
+            logger.error(f"❌ Ошибка при очистке данных: {e}")
+
 # --- Настройка объекта Application из python-telegram-bot ---
 if not TOKEN:
     logger.error("Error: Bot TOKEN not found in environment variables!")
@@ -539,15 +610,22 @@ is_application_initialized = False
 @app.before_serving
 async def startup():
     """Запускается при старте приложения"""
-    global ping_task
+    global ping_task, cleanup_task
     
     # Инициализация базы данных
     logger.info("🚀 Инициализация базы данных...")
     await create_tables()
     logger.info("✅ База данных готова")
     
+    # Очистка старых данных при запуске
+    logger.info("🧹 Первоначальная очистка старых данных...")
+    await clean_old_data()
+    
     logger.info("🚀 Запуск самопинга...")
     ping_task = asyncio.create_task(self_ping())
+    
+    logger.info("🚀 Запуск периодической очистки данных...")
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     
     # Устанавливаем меню команд
     logger.info("Устанавливаем меню команд...")
@@ -556,12 +634,21 @@ async def startup():
 @app.after_serving
 async def shutdown():
     """Запускается при остановке приложения"""
-    global ping_task
+    global ping_task, cleanup_task
+    
     if ping_task:
         logger.info("🛑 Остановка самопинга...")
         ping_task.cancel()
         try:
             await ping_task
+        except asyncio.CancelledError:
+            pass
+    
+    if cleanup_task:
+        logger.info("🛑 Остановка очистки данных...")
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
         except asyncio.CancelledError:
             pass
 
