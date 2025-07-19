@@ -8,9 +8,14 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from quart import Quart, request, Response
+import asyncpg
+from asyncpg import Record
+from asyncpg.pool import Pool
+from io import BytesIO
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")  # Строка подключения к Neon.tech
 CREATOR_ID = 7106925462  # ID создателя бота
 
 # Замени на ссылку на твой закрытый канал
@@ -21,9 +26,6 @@ WEBHOOK_PATH = "webhook"
 SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
 PING_INTERVAL = 600  # 10 минут
 
-# Путь к файлу статистики
-STATS_FILE = "stats.json"
-
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
@@ -33,31 +35,93 @@ logger = logging.getLogger(__name__)
 # Глобальная переменная для задачи пинга
 ping_task = None
 
-# --- Система статистики ---
-def load_stats():
-    """Загружает статистику из файла"""
+# --- Функции для работы с базой данных Neon.tech ---
+async def create_tables():
+    """Создает таблицы в базе данных, если они не существуют"""
     try:
-        if Path(STATS_FILE).exists():
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                start_time TIMESTAMP DEFAULT NOW()
+            );
+            
+            CREATE TABLE IF NOT EXISTS events (
+                event_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                event_type TEXT,
+                event_time TIMESTAMP DEFAULT NOW()
+            );
+        ''')
+        logger.info("✅ Таблицы в базе данных созданы/проверены")
+        await conn.close()
     except Exception as e:
-        logger.error(f"Error loading stats: {e}")
-    return {
+        logger.error(f"❌ Ошибка создания таблиц: {e}")
+        raise
+
+async def save_user(user):
+    """Сохраняет пользователя в базу данных"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            INSERT INTO users (user_id, username, first_name, last_name)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name
+        ''', user.id, user.username, user.first_name, user.last_name)
+        await conn.close()
+        logger.info(f"👤 Пользователь {user.id} сохранен в БД")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения пользователя {user.id}: {e}")
+
+async def log_event(user_id, event_type):
+    """Логирует событие в базе данных"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            INSERT INTO events (user_id, event_type)
+            VALUES ($1, $2)
+        ''', user_id, event_type)
+        await conn.close()
+        logger.info(f"📝 Событие '{event_type}' для {user_id} записано в БД")
+    except Exception as e:
+        logger.error(f"❌ Ошибка записи события: {e}")
+
+async def get_stats():
+    """Возвращает статистику из базы данных"""
+    stats = {
         "total_users": 0,
-        "link_clicks": 0,
-        "users": {}
+        "link_clicks": 0
     }
-
-def save_stats(stats):
-    """Сохраняет статистику в файл"""
     try:
-        with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
+        conn = await asyncpg.connect(DATABASE_URL)
+        stats['total_users'] = await conn.fetchval('SELECT COUNT(*) FROM users')
+        stats['link_clicks'] = await conn.fetchval("SELECT COUNT(*) FROM events WHERE event_type = 'link_click'")
+        await conn.close()
     except Exception as e:
-        logger.error(f"Error saving stats: {e}")
+        logger.error(f"❌ Ошибка получения статистики: {e}")
+    return stats
 
-# Инициализация статистики
-stats = load_stats()
+async def get_full_stats():
+    """Возвращает полную статистику для экспорта"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        users = await conn.fetch("SELECT * FROM users")
+        events = await conn.fetch("SELECT * FROM events")
+        await conn.close()
+        
+        return {
+            "users": [dict(user) for user in users],
+            "events": [dict(event) for event in events]
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения полной статистики: {e}")
+        return {}
 
 async def setup_menu(application: Application):
     """Устанавливает меню команд в боте"""
@@ -71,23 +135,12 @@ async def setup_menu(application: Application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /start и отправляет ссылку с клавиатурой."""
-    global stats
     user = update.effective_user
     logger.info(f"Received /start command from user {user.id}")
     
-    # Обновляем статистику
-    user_id_str = str(user.id)
-    if user_id_str not in stats['users']:
-        stats['total_users'] += 1
-        stats['users'][user_id_str] = {
-            "id": user.id,
-            "username": user.username,
-            "first_name": user.first_name,
-            "last_name": user.last_name,
-            "start_time": datetime.now().isoformat(),
-            "link_clicks": 0
-        }
-        save_stats(stats)
+    # Сохраняем пользователя в БД
+    await save_user(user)
+    await log_event(user.id, 'start')
     
     # Создаем клавиатуру с кнопкой
     keyboard = [
@@ -134,17 +187,8 @@ async def track_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     logger.info(f"Button clicked by user {query.from_user.id}")
     
-    # Обновляем статистику переходов
-    user_id_str = str(query.from_user.id)
-    global stats
-    
-    if user_id_str in stats['users']:
-        stats['users'][user_id_str]['link_clicks'] += 1
-        stats['link_clicks'] += 1
-        save_stats(stats)
-        logger.info(f"Updated link click stats for user {query.from_user.id}")
-    else:
-        logger.warning(f"User {query.from_user.id} clicked but not in stats")
+    # Логируем событие в БД
+    await log_event(query.from_user.id, 'link_click')
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет статистику создателю бота"""
@@ -155,7 +199,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
         return
     
-    global stats
+    # Получаем статистику из БД
+    stats = await get_stats()
+    full_stats = await get_full_stats()
+    
     message = (
         f"📊 <b>Статистика бота:</b>\n\n"
         f"👤 Всего пользователей: <b>{stats['total_users']}</b>\n"
@@ -168,12 +215,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_html(message)
         
         # Отправляем файл с полной статистикой
-        with open(STATS_FILE, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename='bot_stats.json',
-                caption="Полная статистика в JSON"
-            )
+        stats_json = json.dumps(full_stats, indent=2, default=str, ensure_ascii=False)
+        await update.message.reply_document(
+            document=BytesIO(stats_json.encode('utf-8')),
+            filename='bot_stats.json',
+            caption="Полная статистика в JSON"
+        )
         logger.info(f"Sent stats to creator {user.id}")
     except Exception as e:
         logger.error(f"Error sending stats: {e}")
@@ -231,6 +278,12 @@ is_application_initialized = False
 async def startup():
     """Запускается при старте приложения"""
     global ping_task
+    
+    # Инициализация базы данных
+    logger.info("🚀 Инициализация базы данных...")
+    await create_tables()
+    logger.info("✅ База данных готова")
+    
     logger.info("🚀 Запуск самопинга...")
     ping_task = asyncio.create_task(self_ping())
     
@@ -297,15 +350,23 @@ async def telegram_webhook_handler():
 @app.route("/", methods=["GET"])
 async def health_check():
     """Проверка состояния сервера."""
+    try:
+        # Проверяем подключение к базе данных
+        conn = await asyncpg.connect(DATABASE_URL)
+        db_status = "connected"
+        await conn.close()
+    except Exception as e:
+        db_status = f"disconnected: {str(e)}"
+    
+    stats = await get_stats()
+    
     return {
         "status": "Bot is running", 
         "webhook_url": f"/{WEBHOOK_PATH}",
         "ping_status": "active" if ping_task and not ping_task.done() else "inactive",
+        "database": db_status,
         "timestamp": datetime.now().isoformat(),
-        "stats": {
-            "total_users": stats['total_users'],
-            "link_clicks": stats['link_clicks']
-        }
+        "stats": stats
     }
 
 # Добавляем маршрут для установки webhook
