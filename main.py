@@ -13,7 +13,7 @@ from telegram import (
     ChatMember
 )
 from telegram.constants import ParseMode
-from telegram.error import Forbidden
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application, 
     CommandHandler, 
@@ -23,9 +23,6 @@ from telegram.ext import (
 from quart import Quart, request, Response
 import asyncpg
 from io import BytesIO
-import humanize
-from collections import defaultdict
-import tzlocal
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
@@ -316,7 +313,7 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Обрабатывает команду /channel"""
     keyboard = [
         [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ Проверить подпику", callback_data='check_subscription')]
+        [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -398,12 +395,23 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
     
     except Forbidden as e:
-        # Обработка ошибки "bot is not a member"
+        # Обработка ошибки "bot is not a member" или недостаточных прав
         logger.error(f"Ошибка проверки подписки: {e}")
         error_text = (
-            "⚠️ Бот не является участником канала. "
-            "Пожалуйста, добавьте бота в канал как участника, затем попробуйте снова."
+            "⚠️ Недостаточно прав для проверки подписки.\n\n"
+            "Пожалуйста, убедитесь, что бот:\n"
+            "1. Добавлен как участник канала\n"
+            "2. Имеет право 'Публикация сообщений' в настройках администратора канала"
         )
+        if query:
+            await query.edit_message_text(error_text)
+        else:
+            await message.reply_text(error_text)
+    
+    except BadRequest as e:
+        # Обработка неправильного CHANNEL_ID
+        logger.error(f"Ошибка проверки подписки: {e}")
+        error_text = "⚠️ Ошибка конфигурации бота. Пожалуйста, сообщите администратору."
         if query:
             await query.edit_message_text(error_text)
         else:
@@ -412,8 +420,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Ошибка проверки подписки: {e}")
         error_text = (
-            "⚠️ Произошла ошибка при проверке подписки. "
-            "Убедитесь, что бот добавлен как администратор канала с правом просмотра участников. "
+            "⚠️ Произошла неизвестная ошибка при проверке подписки. "
             "Пожалуйста, попробуйте позже."
         )
         if query:
