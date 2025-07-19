@@ -3,22 +3,37 @@ import os
 import asyncio
 import aiohttp
 import json
+import pytz
 from datetime import datetime
-from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-from quart import Quart, request, Response
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    BotCommand,
+    ChatMember
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    ContextTypes, 
+    CallbackQueryHandler,
+    CallbackContext
+)
+from quart import Quart, request, Response, jsonify
 import asyncpg
-from asyncpg import Record
-from asyncpg.pool import Pool
 from io import BytesIO
+import humanize
+from collections import defaultdict
+import tzlocal
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Строка подключения к Neon.tech
 CREATOR_ID = 7106925462  # ID создателя бота
 
-# Замени на ссылку на твой закрытый канал
+# Настройки канала
+CHANNEL_ID = -1002699957973  # ID вашего канала
 CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
 WEBHOOK_PATH = "webhook"
 
@@ -26,6 +41,7 @@ WEBHOOK_PATH = "webhook"
 SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
 PING_INTERVAL = 600  # 10 минут
 
+# Настройки логгирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
     level=logging.INFO
@@ -46,6 +62,7 @@ async def create_tables():
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
+                country_code TEXT,
                 start_time TIMESTAMP DEFAULT NOW()
             );
             
@@ -53,7 +70,15 @@ async def create_tables():
                 event_id SERIAL PRIMARY KEY,
                 user_id BIGINT REFERENCES users(user_id),
                 event_type TEXT,
+                device_type TEXT,
                 event_time TIMESTAMP DEFAULT NOW()
+            );
+            
+            CREATE TABLE IF NOT EXISTS channel_joins (
+                join_id SERIAL PRIMARY KEY,
+                user_id BIGINT REFERENCES users(user_id),
+                join_time TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id)
             );
         ''')
         logger.info("✅ Таблицы в базе данных созданы/проверены")
@@ -62,50 +87,145 @@ async def create_tables():
         logger.error(f"❌ Ошибка создания таблиц: {e}")
         raise
 
-async def save_user(user):
+async def save_user(user, country_code=None):
     """Сохраняет пользователя в базу данных"""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         await conn.execute('''
-            INSERT INTO users (user_id, username, first_name, last_name)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO users (user_id, username, first_name, last_name, country_code)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (user_id) DO UPDATE SET
                 username = EXCLUDED.username,
                 first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name
-        ''', user.id, user.username, user.first_name, user.last_name)
+                last_name = EXCLUDED.last_name,
+                country_code = EXCLUDED.country_code
+        ''', user.id, user.username, user.first_name, user.last_name, country_code)
         await conn.close()
         logger.info(f"👤 Пользователь {user.id} сохранен в БД")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения пользователя {user.id}: {e}")
 
-async def log_event(user_id, event_type):
+async def log_event(user_id, event_type, device_type):
     """Логирует событие в базе данных"""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         await conn.execute('''
-            INSERT INTO events (user_id, event_type)
-            VALUES ($1, $2)
-        ''', user_id, event_type)
+            INSERT INTO events (user_id, event_type, device_type)
+            VALUES ($1, $2, $3)
+        ''', user_id, event_type, device_type)
         await conn.close()
         logger.info(f"📝 Событие '{event_type}' для {user_id} записано в БД")
     except Exception as e:
         logger.error(f"❌ Ошибка записи события: {e}")
 
-async def get_stats():
-    """Возвращает статистику из базы данных"""
+async def log_channel_join(user_id):
+    """Логирует вступление пользователя в канал"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            INSERT INTO channel_joins (user_id)
+            VALUES ($1)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', user_id)
+        await conn.close()
+        logger.info(f"✅ Пользователь {user_id} вступил в канал")
+    except Exception as e:
+        logger.error(f"❌ Ошибка записи вступления в канал: {e}")
+
+async def is_user_joined(user_id):
+    """Проверяет, вступил ли пользователь в канал"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        joined = await conn.fetchval('''
+            SELECT EXISTS(SELECT 1 FROM channel_joins WHERE user_id = $1)
+        ''', user_id)
+        await conn.close()
+        return joined
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки подписки: {e}")
+        return False
+
+async def get_basic_stats():
+    """Возвращает базовую статистику"""
     stats = {
         "total_users": 0,
-        "link_clicks": 0
+        "link_clicks": 0,
+        "channel_joins": 0
     }
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         stats['total_users'] = await conn.fetchval('SELECT COUNT(*) FROM users')
         stats['link_clicks'] = await conn.fetchval("SELECT COUNT(*) FROM events WHERE event_type = 'link_click'")
+        stats['channel_joins'] = await conn.fetchval("SELECT COUNT(*) FROM channel_joins")
         await conn.close()
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
     return stats
+
+async def get_geo_stats():
+    """Возвращает статистику по странам"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        result = await conn.fetch('''
+            SELECT country_code, COUNT(*) AS count
+            FROM users
+            WHERE country_code IS NOT NULL
+            GROUP BY country_code
+            ORDER BY count DESC
+        ''')
+        await conn.close()
+        return {row['country_code']: row['count'] for row in result}
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения гео-статистики: {e}")
+        return {}
+
+async def get_device_stats():
+    """Возвращает статистику по устройствам"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        result = await conn.fetch('''
+            SELECT device_type, COUNT(*) AS count
+            FROM events
+            WHERE device_type IS NOT NULL
+            GROUP BY device_type
+            ORDER BY count DESC
+        ''')
+        await conn.close()
+        return {row['device_type']: row['count'] for row in result}
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения статистики устройств: {e}")
+        return {}
+
+async def get_time_stats():
+    """Возвращает статистику по времени активности"""
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Статистика по часам
+        hourly_stats = await conn.fetch('''
+            SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC') AS hour, COUNT(*) AS count
+            FROM events
+            GROUP BY hour
+            ORDER BY hour
+        ''')
+        
+        # Статистика по дням недели
+        daily_stats = await conn.fetch('''
+            SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC') AS day, COUNT(*) AS count
+            FROM events
+            GROUP BY day
+            ORDER BY day
+        ''')
+        
+        await conn.close()
+        
+        return {
+            "hourly": {int(row['hour']): row['count'] for row in hourly_stats},
+            "daily": {int(row['day']): row['count'] for row in daily_stats}
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения временной статистики: {e}")
+        return {"hourly": {}, "daily": {}}
 
 async def get_full_stats():
     """Возвращает полную статистику для экспорта"""
@@ -113,11 +233,13 @@ async def get_full_stats():
         conn = await asyncpg.connect(DATABASE_URL)
         users = await conn.fetch("SELECT * FROM users")
         events = await conn.fetch("SELECT * FROM events")
+        joins = await conn.fetch("SELECT * FROM channel_joins")
         await conn.close()
         
         return {
             "users": [dict(user) for user in users],
-            "events": [dict(event) for event in events]
+            "events": [dict(event) for event in events],
+            "channel_joins": [dict(join) for join in joins]
         }
     except Exception as e:
         logger.error(f"❌ Ошибка получения полной статистики: {e}")
@@ -128,29 +250,38 @@ async def setup_menu(application: Application):
     commands = [
         BotCommand("start", "Начать работу с ботом"),
         BotCommand("help", "Помощь по использованию бота"),
-        BotCommand("channel", "Получить ссылку на канал"),
+        BotCommand("channel", "Получить доступ к каналу"),
+        BotCommand("check", "Проверить подписку на канал"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Меню команд установлено")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обрабатывает команду /start и отправляет ссылку с клавиатурой."""
+    """Обрабатывает команду /start"""
     user = update.effective_user
     logger.info(f"Received /start command from user {user.id}")
     
+    # Определяем страну и устройство
+    country_code = None
+    if hasattr(user, 'language_code') and user.language_code:
+        country_code = user.language_code.split('-')[-1].upper() if '-' in user.language_code else user.language_code.upper()
+    
+    device_type = "mobile" if update.effective_message and update.effective_message.via_bot else "desktop"
+    
     # Сохраняем пользователя в БД
-    await save_user(user)
-    await log_event(user.id, 'start')
+    await save_user(user, country_code)
+    await log_event(user.id, 'start', device_type)
     
     # Создаем клавиатуру с кнопкой
     keyboard = [
-        [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
+        [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     try:
         await update.message.reply_html(
-            f"Привет, {user.mention_html()}! Я помогу тебе получить доступ к нашему закрытому каналу.",
+            f"Привет, {user.mention_html()}! Чтобы получить доступ к нашему закрытому каналу, "
+            "пожалуйста, подпишись на него, а затем нажми кнопку ниже для проверки.",
             reply_markup=reply_markup
         )
         logger.info(f"Sent /start response to user {user.id}")
@@ -163,32 +294,104 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🤖 <b>Команды бота:</b>\n\n"
         "/start - Начать работу с ботом\n"
         "/help - Показать эту справку\n"
-        "/channel - Получить ссылку на канал\n"
+        "/channel - Получить доступ к каналу\n"
+        "/check - Проверить подписку на канал\n"
         "\n"
-        "Просто нажми на кнопку <b>«Зайти в канал»</b>, чтобы присоединиться к нашему сообществу!"
+        "После подписки на канал нажмите кнопку <b>«Проверить подписку»</b>, "
+        "чтобы получить доступ к контенту."
     )
     await update.message.reply_html(help_text)
 
 async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /channel"""
     keyboard = [
-        [InlineKeyboardButton("Зайти в канал", url=CHANNEL_LINK)]
+        [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "Нажми кнопку ниже, чтобы перейти в наш закрытый канал:",
+        "Подпишись на наш канал, затем нажми кнопку для проверки:",
         reply_markup=reply_markup
     )
 
-async def track_link_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Отслеживает нажатия на кнопку (для статистики)"""
+async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает команду /check"""
+    await check_subscription(update, context)
+
+async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Проверяет подписку пользователя на канал"""
     query = update.callback_query
-    await query.answer()
-    logger.info(f"Button clicked by user {query.from_user.id}")
+    if query:
+        await query.answer()
+        user = query.from_user
+        message = query.message
+    else:
+        user = update.effective_user
+        message = update.message
     
-    # Логируем событие в БД
-    await log_event(query.from_user.id, 'link_click')
+    logger.info(f"Checking subscription for user {user.id}")
+    
+    # Определяем устройство
+    device_type = "mobile" if message and message.via_bot else "desktop"
+    await log_event(user.id, 'subscription_check', device_type)
+    
+    try:
+        # Проверяем подписку
+        chat_member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user.id)
+        is_member = chat_member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+        
+        if is_member:
+            # Логируем вступление
+            await log_channel_join(user.id)
+            await log_event(user.id, 'channel_join', device_type)
+            
+            # Отправляем приветствие и ссылку
+            response_text = (
+                f"🎉 Отлично, {user.mention_html()}! Ты подписан на наш канал.\n\n"
+                "Вот ссылка для доступа:\n"
+                f"👉 {CHANNEL_LINK}"
+            )
+            
+            # Обновляем сообщение с кнопкой
+            if query:
+                await query.edit_message_text(
+                    text=response_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None
+                )
+            else:
+                await message.reply_html(response_text)
+        else:
+            response_text = (
+                f"❌ {user.mention_html()}, ты еще не подписан на наш канал.\n\n"
+                "Пожалуйста, подпишись и нажми кнопку проверки снова."
+            )
+            
+            # Создаем клавиатуру с кнопкой
+            keyboard = [
+                [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')],
+                [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if query:
+                await query.edit_message_text(
+                    text=response_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+            else:
+                await message.reply_html(
+                    response_text,
+                    reply_markup=reply_markup
+                )
+    except Exception as e:
+        logger.error(f"Ошибка проверки подписки: {e}")
+        error_text = "⚠️ Произошла ошибка при проверке подписки. Пожалуйста, попробуйте позже."
+        if query:
+            await query.edit_message_text(error_text)
+        else:
+            await message.reply_text(error_text)
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет статистику создателю бота"""
@@ -200,13 +403,36 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     
     # Получаем статистику из БД
-    stats = await get_stats()
+    basic_stats = await get_basic_stats()
+    geo_stats = await get_geo_stats()
+    device_stats = await get_device_stats()
+    time_stats = await get_time_stats()
     full_stats = await get_full_stats()
     
+    # Форматируем гео-статистику
+    geo_text = "\n".join([f"  - {country}: {count}" for country, count in geo_stats.items()]) or "  Нет данных"
+    
+    # Форматируем статистику устройств
+    device_text = "\n".join([f"  - {device}: {count}" for device, count in device_stats.items()]) or "  Нет данных"
+    
+    # Форматируем временную статистику
+    peak_hour = max(time_stats.get('hourly', {}).items(), key=lambda x: x[1], default=(0, 0))
+    peak_day = max(time_stats.get('daily', {}).items(), key=lambda x: x[1], default=(0, 0))
+    
+    # Дни недели для удобства
+    weekdays = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    
     message = (
-        f"📊 <b>Статистика бота:</b>\n\n"
-        f"👤 Всего пользователей: <b>{stats['total_users']}</b>\n"
-        f"🖱️ Переходов по ссылке: <b>{stats['link_clicks']}</b>\n"
+        f"📊 <b>Расширенная статистика бота</b>\n\n"
+        f"👤 <u>Пользователи</u>\n"
+        f"  Всего: <b>{basic_stats['total_users']}</b>\n"
+        f"  Подписались на канал: <b>{basic_stats['channel_joins']}</b>\n"
+        f"  Переходов по ссылке: <b>{basic_stats['link_clicks']}</b>\n\n"
+        f"🗺️ <u>География</u>\n{geo_text}\n\n"
+        f"📱 <u>Устройства</u>\n{device_text}\n\n"
+        f"⏱ <u>Активность</u>\n"
+        f"  Пиковый час: <b>{int(peak_hour[0])}:00</b> ({peak_hour[1]} действий)\n"
+        f"  Самый активный день: <b>{weekdays[int(peak_day[0])]}</b> ({peak_day[1]} действий)\n\n"
         f"🕒 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     
@@ -263,8 +489,9 @@ logger.info("Adding command handlers...")
 telegram_application.add_handler(CommandHandler("start", start))
 telegram_application.add_handler(CommandHandler("help", help_command))
 telegram_application.add_handler(CommandHandler("channel", channel_command))
+telegram_application.add_handler(CommandHandler("check", check_command))
 telegram_application.add_handler(CommandHandler("stats", stats_command))
-telegram_application.add_handler(CallbackQueryHandler(track_link_click))
+telegram_application.add_handler(CallbackQueryHandler(check_subscription, pattern='^check_subscription$'))
 logger.info("Command handlers added.")
 
 # --- Настройка Quart приложения (ASGI совместимый) ---
@@ -358,7 +585,9 @@ async def health_check():
     except Exception as e:
         db_status = f"disconnected: {str(e)}"
     
-    stats = await get_stats()
+    stats = await get_basic_stats()
+    geo_stats = await get_geo_stats()
+    device_stats = await get_device_stats()
     
     return {
         "status": "Bot is running", 
@@ -366,7 +595,13 @@ async def health_check():
         "ping_status": "active" if ping_task and not ping_task.done() else "inactive",
         "database": db_status,
         "timestamp": datetime.now().isoformat(),
-        "stats": stats
+        "stats": {
+            "total_users": stats.get('total_users', 0),
+            "channel_joins": stats.get('channel_joins', 0),
+            "link_clicks": stats.get('link_clicks', 0),
+            "countries": geo_stats,
+            "devices": device_stats
+        }
     }
 
 # Добавляем маршрут для установки webhook
