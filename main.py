@@ -13,14 +13,14 @@ from telegram import (
     ChatMember
 )
 from telegram.constants import ParseMode
+from telegram.error import Forbidden
 from telegram.ext import (
     Application, 
     CommandHandler, 
     ContextTypes, 
-    CallbackQueryHandler,
-    CallbackContext
+    CallbackQueryHandler
 )
-from quart import Quart, request, Response, jsonify
+from quart import Quart, request, Response
 import asyncpg
 from io import BytesIO
 import humanize
@@ -316,7 +316,7 @@ async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Обрабатывает команду /channel"""
     keyboard = [
         [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
+        [InlineKeyboardButton("✅ Проверить подпику", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -396,6 +396,19 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     response_text,
                     reply_markup=reply_markup
                 )
+    
+    except Forbidden as e:
+        # Обработка ошибки "bot is not a member"
+        logger.error(f"Ошибка проверки подписки: {e}")
+        error_text = (
+            "⚠️ Бот не является участником канала. "
+            "Пожалуйста, добавьте бота в канал как участника, затем попробуйте снова."
+        )
+        if query:
+            await query.edit_message_text(error_text)
+        else:
+            await message.reply_text(error_text)
+    
     except Exception as e:
         logger.error(f"Ошибка проверки подписки: {e}")
         error_text = (
