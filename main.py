@@ -81,6 +81,15 @@ async def create_tables():
                 UNIQUE(user_id)
             );
         ''')
+        
+        # Добавляем колонки, если они не существуют
+        await conn.execute('''
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
+        ''')
+        await conn.execute('''
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS device_type TEXT;
+        ''')
+        
         logger.info("✅ Таблицы в базе данных созданы/проверены")
         await conn.close()
     except Exception as e:
@@ -105,7 +114,7 @@ async def save_user(user, country_code=None):
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения пользователя {user.id}: {e}")
 
-async def log_event(user_id, event_type, device_type):
+async def log_event(user_id, event_type, device_type=None):
     """Логирует событие в базе данных"""
     try:
         conn = await asyncpg.connect(DATABASE_URL)
@@ -272,8 +281,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await save_user(user, country_code)
     await log_event(user.id, 'start', device_type)
     
-    # Создаем клавиатуру с кнопкой
+    # Создаем клавиатуру с кнопками
     keyboard = [
+        [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
         [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -281,7 +291,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await update.message.reply_html(
             f"Привет, {user.mention_html()}! Чтобы получить доступ к нашему закрытому каналу, "
-            "пожалуйста, подпишись на него, а затем нажми кнопку ниже для проверки.",
+            "пожалуйста, подпишись на него по ссылке ниже, а затем нажми кнопку для проверки.",
             reply_markup=reply_markup
         )
         logger.info(f"Sent /start response to user {user.id}")
@@ -305,6 +315,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /channel"""
     keyboard = [
+        [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
         [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -348,7 +359,7 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Отправляем приветствие и ссылку
             response_text = (
                 f"🎉 Отлично, {user.mention_html()}! Ты подписан на наш канал.\n\n"
-                "Вот ссылка для доступа:\n"
+                "Теперь ты можешь перейти в канал по этой ссылке:\n"
                 f"👉 {CHANNEL_LINK}"
             )
             
@@ -364,13 +375,13 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             response_text = (
                 f"❌ {user.mention_html()}, ты еще не подписан на наш канал.\n\n"
-                "Пожалуйста, подпишись и нажми кнопку проверки снова."
+                "Пожалуйста, подпишись по ссылке ниже и нажми кнопку проверки снова."
             )
             
             # Создаем клавиатуру с кнопкой
             keyboard = [
-                [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')],
-                [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)]
+                [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
+                [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
@@ -387,7 +398,11 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
     except Exception as e:
         logger.error(f"Ошибка проверки подписки: {e}")
-        error_text = "⚠️ Произошла ошибка при проверке подписки. Пожалуйста, попробуйте позже."
+        error_text = (
+            "⚠️ Произошла ошибка при проверке подписки. "
+            "Убедитесь, что бот добавлен как администратор канала с правом просмотра участников. "
+            "Пожалуйста, попробуйте позже."
+        )
         if query:
             await query.edit_message_text(error_text)
         else:
