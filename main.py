@@ -36,7 +36,7 @@ CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/+57Wq6w2wbYhkNjYy")
 WEBHOOK_PATH = "webhook"
 
 # URL для самопинга (замените на ваш актуальный URL)
-SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
+SELF_PING_URL = "https://miaphotoroom.onrender.com"
 PING_INTERVAL = 600  # 10 минут
 
 # Настройки логгирования
