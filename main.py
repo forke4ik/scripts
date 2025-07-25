@@ -1,3 +1,5 @@
+import psycopg
+from psycopg.rows import dict_row
 import logging
 import os
 import asyncio
