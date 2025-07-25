@@ -35,7 +35,7 @@ CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
 WEBHOOK_PATH = "webhook"
 
 # URL для самопинга (замените на ваш актуальный URL)
-SELF_PING_URL = "https://miaphotoroom.onrender.com"
+SELF_PING_URL = "https://my-telegram-webhook-bot.onrender.com"
 PING_INTERVAL = 600  # 10 минут
 
 # Настройки логгирования
@@ -601,23 +601,17 @@ is_application_initialized = False
 
 @app.before_serving
 async def startup():
+    """Запускается при старте приложения"""
     global ping_task, cleanup_task
     
+    # Инициализация базы данных
     logger.info("🚀 Инициализация базы данных...")
     await create_tables()
     logger.info("✅ База данных готова")
     
+    # Очистка старых данных при запуске
     logger.info("🧹 Первоначальная очистка старых данных...")
     await clean_old_data()
-    
-    # Автоматическая установка вебхука
-    logger.info("🚀 Установка вебхука...")
-    webhook_url = f"{SELF_PING_URL}/{WEBHOOK_PATH}"
-    try:
-        await telegram_application.bot.set_webhook(webhook_url)
-        logger.info(f"✅ Вебхук установлен: {webhook_url}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка установки вебхука: {e}")
     
     logger.info("🚀 Запуск самопинга...")
     ping_task = asyncio.create_task(self_ping())
@@ -625,6 +619,7 @@ async def startup():
     logger.info("🚀 Запуск периодической очистки данных...")
     cleanup_task = asyncio.create_task(periodic_cleanup())
     
+    # Устанавливаем меню команд
     logger.info("Устанавливаем меню команд...")
     await setup_menu(telegram_application)
 
