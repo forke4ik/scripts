@@ -1,5 +1,3 @@
-import psycopg
-from psycopg.rows import dict_row
 import logging
 import os
 import asyncio
@@ -739,12 +737,12 @@ async def telegram_webhook_handler():
 @app.route("/", methods=["GET"])
 async def health_check():
     """Проверка состояния сервера."""
-   try:
-    # Проверяем подключение к базе данных
-    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
-        db_status = "connected"
-except Exception as e:
-    db_status = f"disconnected: {str(e)}"
+    try:
+        # Проверяем подключение к базе данных
+        async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+            db_status = "connected"
+    except Exception as e:
+        db_status = f"disconnected: {str(e)}"
     
     stats = await get_basic_stats()
     geo_stats = await get_geo_stats()
