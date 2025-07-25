@@ -21,17 +21,18 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from quart import Quart, request, Response
-import asyncpg
+import psycopg
+from psycopg.rows import dict_row
 from io import BytesIO
 
 # TOKEN из переменных окружения Render
 TOKEN = os.environ.get("TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")  # Строка подключения к Neon.tech
-CREATOR_ID = 7106925462  # ID создателя бота
+CREATOR_ID = int(os.environ.get("CREATOR_ID", "7106925462"))  # ID создателя бота
 
 # Настройки канала
-CHANNEL_ID = -1002699957973  # ID вашего канала
-CHANNEL_LINK = "https://t.me/+57Wq6w2wbYhkNjYy"
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "-1002699957973"))  # ID вашего канала
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/+57Wq6w2wbYhkNjYy")
 WEBHOOK_PATH = "webhook"
 
 # URL для самопинга (замените на ваш актуальный URL)
@@ -53,43 +54,46 @@ cleanup_task = None  # Для периодической очистки данн
 async def create_tables():
     """Создает таблицы в базе данных, если они не существуют"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                country_code TEXT,
-                device_type TEXT,
-                start_time TIMESTAMP DEFAULT NOW()
-            );
-            
-            CREATE TABLE IF NOT EXISTS events (
-                event_id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                event_type TEXT,
-                event_time TIMESTAMP DEFAULT NOW()
-            );
-            
-            CREATE TABLE IF NOT EXISTS channel_joins (
-                join_id SERIAL PRIMARY KEY,
-                user_id BIGINT REFERENCES users(user_id),
-                join_time TIMESTAMP DEFAULT NOW(),
-                UNIQUE(user_id)
-            );
-        ''')
-        
-        # Добавляем колонки, если они не существуют
-        await conn.execute('''
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
-        ''')
-        await conn.execute('''
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS device_type TEXT;
-        ''')
-        
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id BIGINT PRIMARY KEY,
+                        username TEXT,
+                        first_name TEXT,
+                        last_name TEXT,
+                        country_code TEXT,
+                        device_type TEXT,
+                        start_time TIMESTAMP DEFAULT NOW()
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS events (
+                        event_id SERIAL PRIMARY KEY,
+                        user_id BIGINT REFERENCES users(user_id),
+                        event_type TEXT,
+                        event_time TIMESTAMP DEFAULT NOW()
+                    );
+                    
+                    CREATE TABLE IF NOT EXISTS channel_joins (
+                        join_id SERIAL PRIMARY KEY,
+                        user_id BIGINT REFERENCES users(user_id),
+                        join_time TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(user_id)
+                    );
+                ''')
+                
+                # Добавляем колонки, если они не существуют
+                await cursor.execute('''
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
+                ''')
+                await cursor.execute('''
+                    ALTER TABLE users ADD COLUMN IF NOT EXISTS device_type TEXT;
+                ''')
+                
         logger.info("✅ Таблицы в базе данных созданы/проверены")
-        await conn.close()
     except Exception as e:
         logger.error(f"❌ Ошибка создания таблиц: {e}")
         raise
@@ -99,35 +103,40 @@ async def clean_old_data():
     try:
         one_week_ago = datetime.now() - timedelta(days=7)
         
-        conn = await asyncpg.connect(DATABASE_URL)
-        
-        # Удаляем старые события
-        await conn.execute('''
-            DELETE FROM events 
-            WHERE event_time < $1
-        ''', one_week_ago)
-        
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                # Удаляем старые события
+                await cursor.execute('''
+                    DELETE FROM events 
+                    WHERE event_time < %s
+                ''', (one_week_ago,))
+                
         logger.info(f"🧹 Очищены старые события (старше {one_week_ago})")
-        
-        await conn.close()
     except Exception as e:
         logger.error(f"❌ Ошибка очистки старых данных: {e}")
 
 async def save_user(user, country_code=None, device_type=None):
     """Сохраняет или обновляет пользователя в базе данных"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute('''
-            INSERT INTO users (user_id, username, first_name, last_name, country_code, device_type)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (user_id) DO UPDATE SET
-                username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                last_name = EXCLUDED.last_name,
-                country_code = COALESCE(EXCLUDED.country_code, users.country_code),
-                device_type = COALESCE(EXCLUDED.device_type, users.device_type)
-        ''', user.id, user.username, user.first_name, user.last_name, country_code, device_type)
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    INSERT INTO users (user_id, username, first_name, last_name, country_code, device_type)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        first_name = EXCLUDED.first_name,
+                        last_name = EXCLUDED.last_name,
+                        country_code = COALESCE(EXCLUDED.country_code, users.country_code),
+                        device_type = COALESCE(EXCLUDED.device_type, users.device_type)
+                ''', (user.id, user.username, user.first_name, user.last_name, country_code, device_type))
+                
         logger.info(f"👤 Пользователь {user.id} сохранен/обновлен в БД")
     except Exception as e:
         logger.error(f"❌ Ошибка сохранения пользователя {user.id}: {e}")
@@ -135,12 +144,16 @@ async def save_user(user, country_code=None, device_type=None):
 async def log_event(user_id, event_type):
     """Логирует событие в базе данных"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute('''
-            INSERT INTO events (user_id, event_type)
-            VALUES ($1, $2)
-        ''', user_id, event_type)
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    INSERT INTO events (user_id, event_type)
+                    VALUES (%s, %s)
+                ''', (user_id, event_type))
+                
         logger.info(f"📝 Событие '{event_type}' для {user_id} записано в БД")
     except Exception as e:
         logger.error(f"❌ Ошибка записи события: {e}")
@@ -148,13 +161,17 @@ async def log_event(user_id, event_type):
 async def log_channel_join(user_id):
     """Логирует вступление пользователя в канал"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute('''
-            INSERT INTO channel_joins (user_id)
-            VALUES ($1)
-            ON CONFLICT (user_id) DO NOTHING
-        ''', user_id)
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    INSERT INTO channel_joins (user_id)
+                    VALUES (%s)
+                    ON CONFLICT (user_id) DO NOTHING
+                ''', (user_id,))
+                
         logger.info(f"✅ Пользователь {user_id} вступил в канал")
     except Exception as e:
         logger.error(f"❌ Ошибка записи вступления в канал: {e}")
@@ -162,12 +179,16 @@ async def log_channel_join(user_id):
 async def is_user_joined(user_id):
     """Проверяет, вступил ли пользователь в канал"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        joined = await conn.fetchval('''
-            SELECT EXISTS(SELECT 1 FROM channel_joins WHERE user_id = $1)
-        ''', user_id)
-        await conn.close()
-        return joined
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    SELECT EXISTS(SELECT 1 FROM channel_joins WHERE user_id = %s)
+                ''', (user_id,))
+                result = await cursor.fetchone()
+                return result[0] if result else False
     except Exception as e:
         logger.error(f"❌ Ошибка проверки подписки: {e}")
         return False
@@ -182,26 +203,32 @@ async def get_basic_stats():
     try:
         one_week_ago = datetime.now() - timedelta(days=7)
         
-        conn = await asyncpg.connect(DATABASE_URL)
-        
-        # Общее количество пользователей
-        stats['total_users'] = await conn.fetchval('SELECT COUNT(*) FROM users')
-        
-        # Активные пользователи за неделю
-        stats['active_users_week'] = await conn.fetchval(
-            "SELECT COUNT(DISTINCT user_id) FROM events "
-            "WHERE event_time >= $1",
-            one_week_ago
-        )
-        
-        # Вступления в канал за неделю
-        stats['channel_joins_week'] = await conn.fetchval(
-            "SELECT COUNT(*) FROM channel_joins "
-            "WHERE join_time >= $1",
-            one_week_ago
-        )
-        
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                # Общее количество пользователей
+                await cursor.execute('SELECT COUNT(*) FROM users')
+                stats['total_users'] = (await cursor.fetchone())[0]
+                
+                # Активные пользователи за неделю
+                await cursor.execute(
+                    "SELECT COUNT(DISTINCT user_id) FROM events "
+                    "WHERE event_time >= %s",
+                    (one_week_ago,)
+                )
+                stats['active_users_week'] = (await cursor.fetchone())[0]
+                
+                # Вступления в канал за неделю
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM channel_joins "
+                    "WHERE join_time >= %s",
+                    (one_week_ago,)
+                )
+                stats['channel_joins_week'] = (await cursor.fetchone())[0]
+                
+        return stats
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики: {e}")
     return stats
@@ -209,16 +236,20 @@ async def get_basic_stats():
 async def get_geo_stats():
     """Возвращает статистику по странам (уникальные пользователи)"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        result = await conn.fetch('''
-            SELECT country_code, COUNT(*) AS user_count
-            FROM users
-            WHERE country_code IS NOT NULL
-            GROUP BY country_code
-            ORDER BY user_count DESC
-        ''')
-        await conn.close()
-        return {row['country_code']: row['user_count'] for row in result}
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    SELECT country_code, COUNT(*) AS user_count
+                    FROM users
+                    WHERE country_code IS NOT NULL
+                    GROUP BY country_code
+                    ORDER BY user_count DESC
+                ''')
+                result = await cursor.fetchall()
+                return {row['country_code']: row['user_count'] for row in result}
     except Exception as e:
         logger.error(f"❌ Ошибка получения гео-статистики: {e}")
         return {}
@@ -226,16 +257,20 @@ async def get_geo_stats():
 async def get_device_stats():
     """Возвращает статистику по устройствам (уникальные пользователи)"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        result = await conn.fetch('''
-            SELECT device_type, COUNT(*) AS user_count
-            FROM users
-            WHERE device_type IS NOT NULL
-            GROUP BY device_type
-            ORDER BY user_count DESC
-        ''')
-        await conn.close()
-        return {row['device_type']: row['user_count'] for row in result}
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute('''
+                    SELECT device_type, COUNT(*) AS user_count
+                    FROM users
+                    WHERE device_type IS NOT NULL
+                    GROUP BY device_type
+                    ORDER BY user_count DESC
+                ''')
+                result = await cursor.fetchall()
+                return {row['device_type']: row['user_count'] for row in result}
     except Exception as e:
         logger.error(f"❌ Ошибка получения статистики устройств: {e}")
         return {}
@@ -246,29 +281,32 @@ async def get_time_stats():
         one_week_ago = datetime.now() - timedelta(days=7)
         local_tz = pytz.timezone('Europe/Moscow')  # Замените на нужный часовой пояс
         
-        conn = await asyncpg.connect(DATABASE_URL)
-        
-        # Статистика по часам (в локальном времени)
-        hourly_stats = await conn.fetch('''
-            SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE $1) AS hour, 
-                   COUNT(DISTINCT user_id) AS user_count
-            FROM events
-            WHERE event_time >= $2
-            GROUP BY hour
-            ORDER BY hour
-        ''', local_tz.zone, one_week_ago)
-        
-        # Статистика по дням недели (в локальном времени)
-        daily_stats = await conn.fetch('''
-            SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE $1) AS day, 
-                   COUNT(DISTINCT user_id) AS user_count
-            FROM events
-            WHERE event_time >= $2
-            GROUP BY day
-            ORDER BY day
-        ''', local_tz.zone, one_week_ago)
-        
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                # Статистика по часам (в локальном времени)
+                await cursor.execute('''
+                    SELECT EXTRACT(HOUR FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE %s) AS hour, 
+                           COUNT(DISTINCT user_id) AS user_count
+                    FROM events
+                    WHERE event_time >= %s
+                    GROUP BY hour
+                    ORDER BY hour
+                ''', (local_tz.zone, one_week_ago))
+                hourly_stats = await cursor.fetchall()
+                
+                # Статистика по дням недели (в локальном времени)
+                await cursor.execute('''
+                    SELECT EXTRACT(DOW FROM event_time AT TIME ZONE 'UTC' AT TIME ZONE %s) AS day, 
+                           COUNT(DISTINCT user_id) AS user_count
+                    FROM events
+                    WHERE event_time >= %s
+                    GROUP BY day
+                    ORDER BY day
+                ''', (local_tz.zone, one_week_ago))
+                daily_stats = await cursor.fetchall()
         
         return {
             "hourly": {int(row['hour']): row['user_count'] for row in hourly_stats},
@@ -281,16 +319,24 @@ async def get_time_stats():
 async def get_full_stats():
     """Возвращает полную статистику для экспорта"""
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        users = await conn.fetch("SELECT * FROM users")
-        events = await conn.fetch("SELECT * FROM events")
-        joins = await conn.fetch("SELECT * FROM channel_joins")
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(
+            DATABASE_URL, 
+            row_factory=dict_row
+        ) as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT * FROM users")
+                users = await cursor.fetchall()
+                
+                await cursor.execute("SELECT * FROM events")
+                events = await cursor.fetchall()
+                
+                await cursor.execute("SELECT * FROM channel_joins")
+                joins = await cursor.fetchall()
         
         return {
-            "users": [dict(user) for user in users],
-            "events": [dict(event) for event in events],
-            "channel_joins": [dict(join) for join in joins]
+            "users": users,
+            "events": events,
+            "channel_joins": joins
         }
     except Exception as e:
         logger.error(f"❌ Ошибка получения полной статистики: {e}")
@@ -693,9 +739,8 @@ async def health_check():
     """Проверка состояния сервера."""
     try:
         # Проверяем подключение к базе данных
-        conn = await asyncpg.connect(DATABASE_URL)
-        db_status = "connected"
-        await conn.close()
+        async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+            db_status = "connected"
     except Exception as e:
         db_status = f"disconnected: {str(e)}"
     
