@@ -7,4 +7,4 @@ asyncpg==0.28.0
 pytz==2024.1
 humanize==4.9.0
 tzlocal==5.2
-+ pycparser==2.22; python_version < '3.13'
+pycparser==2.22; python_version < '3.13'
