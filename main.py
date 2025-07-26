@@ -84,15 +84,6 @@ async def create_tables():
                         UNIQUE(user_id)
                     );
                 ''')
-                
-                # Добавляем колонки, если они не существуют
-                await cursor.execute('''
-                    ALTER TABLE users ADD COLUMN IF NOT EXISTS country_code TEXT;
-                ''')
-                await cursor.execute('''
-                    ALTER TABLE users ADD COLUMN IF NOT EXISTS device_type TEXT;
-                ''')
-                
         logger.info("✅ Таблицы в базе данных созданы/проверены")
     except Exception as e:
         logger.error(f"❌ Ошибка создания таблиц: {e}")
@@ -101,7 +92,7 @@ async def create_tables():
 async def clean_old_data():
     """Очищает старые данные (старше 1 недели)"""
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
+        one_week_ago = datetime.utcnow() - timedelta(days=7)
         
         async with await psycopg.AsyncConnection.connect(
             DATABASE_URL, 
@@ -114,11 +105,17 @@ async def clean_old_data():
                     WHERE event_time < %s
                 ''', (one_week_ago,))
                 
-        logger.info(f"🧹 Очищены старые события (старше {one_week_ago})")
+                # Удаляем старые вступления в канал
+                await cursor.execute('''
+                    DELETE FROM channel_joins 
+                    WHERE join_time < %s
+                ''', (one_week_ago,))
+                
+        logger.info(f"🧹 Очищены старые данные (старше {one_week_ago})")
     except Exception as e:
         logger.error(f"❌ Ошибка очистки старых данных: {e}")
 
-async def save_user(user, country_code=None, device_type=None):
+async def save_user(user):
     """Сохраняет или обновляет пользователя в базе данных"""
     try:
         async with await psycopg.AsyncConnection.connect(
@@ -127,15 +124,13 @@ async def save_user(user, country_code=None, device_type=None):
         ) as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute('''
-                    INSERT INTO users (user_id, username, first_name, last_name, country_code, device_type)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO users (user_id, username, first_name, last_name)
+                    VALUES (%s, %s, %s, %s)
                     ON CONFLICT (user_id) DO UPDATE SET
                         username = EXCLUDED.username,
                         first_name = EXCLUDED.first_name,
-                        last_name = EXCLUDED.last_name,
-                        country_code = COALESCE(EXCLUDED.country_code, users.country_code),
-                        device_type = COALESCE(EXCLUDED.device_type, users.device_type)
-                ''', (user.id, user.username, user.first_name, user.last_name, country_code, device_type))
+                        last_name = EXCLUDED.last_name
+                ''', (user.id, user.username, user.first_name, user.last_name))
                 
         logger.info(f"👤 Пользователь {user.id} сохранен/обновлен в БД")
     except Exception as e:
@@ -201,7 +196,7 @@ async def get_basic_stats():
         "channel_joins_week": 0
     }
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
+        one_week_ago = datetime.utcnow() - timedelta(days=7)
         
         async with await psycopg.AsyncConnection.connect(
             DATABASE_URL, 
@@ -210,23 +205,23 @@ async def get_basic_stats():
             async with conn.cursor() as cursor:
                 # Общее количество пользователей
                 await cursor.execute('SELECT COUNT(*) FROM users')
-                stats['total_users'] = (await cursor.fetchone())[0]
+                stats['total_users'] = (await cursor.fetchone())['count']
                 
                 # Активные пользователи за неделю
                 await cursor.execute(
-                    "SELECT COUNT(DISTINCT user_id) FROM events "
+                    "SELECT COUNT(DISTINCT user_id) AS count FROM events "
                     "WHERE event_time >= %s",
                     (one_week_ago,)
                 )
-                stats['active_users_week'] = (await cursor.fetchone())[0]
+                stats['active_users_week'] = (await cursor.fetchone())['count']
                 
                 # Вступления в канал за неделю
                 await cursor.execute(
-                    "SELECT COUNT(*) FROM channel_joins "
+                    "SELECT COUNT(*) AS count FROM channel_joins "
                     "WHERE join_time >= %s",
                     (one_week_ago,)
                 )
-                stats['channel_joins_week'] = (await cursor.fetchone())[0]
+                stats['channel_joins_week'] = (await cursor.fetchone())['count']
                 
         return stats
     except Exception as e:
@@ -278,7 +273,7 @@ async def get_device_stats():
 async def get_time_stats():
     """Возвращает статистику по времени активности (уникальные пользователи)"""
     try:
-        one_week_ago = datetime.now() - timedelta(days=7)
+        one_week_ago = datetime.utcnow() - timedelta(days=7)
         local_tz = pytz.timezone('Europe/Moscow')  # Замените на нужный часовой пояс
         
         async with await psycopg.AsyncConnection.connect(
@@ -358,15 +353,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info(f"Received /start command from user {user.id}")
     
-    # Определяем страну и устройство
-    country_code = None
-    if hasattr(user, 'language_code') and user.language_code:
-        country_code = user.language_code.split('-')[-1].upper() if '-' in user.language_code else user.language_code.upper()
-    
-    device_type = "mobile" if update.effective_message and update.effective_message.via_bot else "desktop"
-    
     # Сохраняем/обновляем пользователя в БД
-    await save_user(user, country_code, device_type)
+    await save_user(user)
     await log_event(user.id, 'start')
     
     # Создаем клавиатуру с кнопками
@@ -430,11 +418,8 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     logger.info(f"Checking subscription for user {user.id}")
     
-    # Определяем устройство
-    device_type = "mobile" if message and message.via_bot else "desktop"
-    
-    # Обновляем информацию об устройстве пользователя
-    await save_user(user, device_type=device_type)
+    # Обновляем информацию о пользователе
+    await save_user(user)
     await log_event(user.id, 'subscription_check')
     
     try:
