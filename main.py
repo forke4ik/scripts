@@ -2,8 +2,7 @@ import logging
 import os
 import asyncio
 import aiohttp
-import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import (
     Update, 
     InlineKeyboardButton, 
@@ -20,7 +19,6 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from quart import Quart, request, Response
-from io import BytesIO
 
 TOKEN = os.environ.get("TOKEN")
 CREATOR_ID = int(os.environ.get("CREATOR_ID", "7106925462"))  
@@ -37,66 +35,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ping_task = None
-cleanup_task = None  
-
-stats_data = {
-    "users": {},
-    "events": [],
-    "channel_joins": []
-}
-
-async def save_user(user):
-    stats_data["users"][user.id] = {
-        "user_id": user.id,
-        "username": user.username,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "country_code": None,
-        "device_type": None,
-        "start_time": datetime.utcnow().isoformat()
-    }
-    logger.info(f"👤 Пользователь {user.id} сохранен/обновлен в памяти")
-
-async def log_event(user_id, event_type):
-    stats_data["events"].append({
-        "user_id": user_id,
-        "event_type": event_type,
-        "event_time": datetime.utcnow().isoformat()
-    })
-    logger.info(f"📝 Событие '{event_type}' для {user_id} записано в память")
-
-async def log_channel_join(user_id):
-    if user_id not in stats_data["channel_joins"]:
-        stats_data["channel_joins"].append(user_id)
-        logger.info(f"✅ Пользователь {user_id} вступил в канал (в памяти)")
-
-async def is_user_joined(user_id):
-    return user_id in stats_data["channel_joins"]
-
-def get_basic_stats():
-    one_week_ago = datetime.utcnow() - timedelta(days=7)
-    
-    total_users = len(stats_data["users"])
-    
-    active_users_week = len(set(
-        event["user_id"] for event in stats_data["events"]
-        if datetime.fromisoformat(event["event_time"]) >= one_week_ago
-    ))
-    
-    channel_joins_week = len([
-        user_id for user_id in stats_data["channel_joins"]
-        if any(
-            datetime.fromisoformat(event["event_time"]) >= one_week_ago
-            for event in stats_data["events"]
-            if event["user_id"] == user_id and event["event_type"] == "channel_join"
-        )
-    ])
-    
-    return {
-        "total_users": total_users,
-        "active_users_week": active_users_week,
-        "channel_joins_week": channel_joins_week
-    }
 
 async def setup_menu(application: Application):
     commands = [
@@ -111,8 +49,6 @@ async def setup_menu(application: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     logger.info(f"Received /start command from user {user.id}")
-    await save_user(user)
-    await log_event(user.id, 'start')
     keyboard = [
         [InlineKeyboardButton("Перейти в канал", url=CHANNEL_LINK)],
         [InlineKeyboardButton("✅ Проверить подписку", callback_data='check_subscription')]
@@ -165,14 +101,10 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user = update.effective_user
         message = update.message
     logger.info(f"Checking subscription for user {user.id}")
-    await save_user(user)
-    await log_event(user.id, 'subscription_check')
     try:
         chat_member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user.id)
         is_member = chat_member.status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER]
         if is_member:
-            await log_channel_join(user.id)
-            await log_event(user.id, 'channel_join')
             response_text = (
                 f"🎉 Отлично, {user.mention_html()}! Ты подписан на наш канал.\n"
                 "Можешь поделиться ссылкой с друзьями:\n"
@@ -238,37 +170,6 @@ async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await message.reply_text(error_text)
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user.id != CREATOR_ID:
-        await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
-        return
-    
-    basic_stats = get_basic_stats()
-    
-    message = (
-        f"📊 <b>Статистика бота</b>\n"
-        f"👤 <u>Пользователи</u>\n"
-        f"  Всего: <b>{basic_stats['total_users']}</b>\n"
-        f"  Активных за неделю: <b>{basic_stats['active_users_week']}</b>\n"
-        f"  Подписались на канал: <b>{basic_stats['channel_joins_week']}</b>\n"
-        f"🕒 Последнее обновление: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    
-    try:
-        await update.message.reply_html(message)
-        
-        stats_json = json.dumps(stats_data, indent=2, default=str, ensure_ascii=False)
-        await update.message.reply_document(
-            document=BytesIO(stats_json.encode('utf-8')),
-            filename='bot_stats.json',
-            caption="Полная статистика"
-        )
-        logger.info(f"Sent stats to creator {user.id}")
-    except Exception as e:
-        logger.error(f"Error sending stats: {e}")
-        await update.message.reply_text(f"Ошибка при формировании статистики: {e}")
-
 async def self_ping():
     while True:
         try:
@@ -302,7 +203,6 @@ telegram_application.add_handler(CommandHandler("start", start))
 telegram_application.add_handler(CommandHandler("help", help_command))
 telegram_application.add_handler(CommandHandler("channel", channel_command))
 telegram_application.add_handler(CommandHandler("check", check_command))
-telegram_application.add_handler(CommandHandler("stats", stats_command))
 telegram_application.add_handler(CallbackQueryHandler(check_subscription, pattern='^check_subscription$'))
 logger.info("Command handlers added.")
 
@@ -366,13 +266,11 @@ async def telegram_webhook_handler():
 
 @app.route("/", methods=["GET"])
 async def health_check():
-    basic_stats = get_basic_stats()
     return {
         "status": "Bot is running", 
         "webhook_url": f"/{WEBHOOK_PATH}",
         "ping_status": "active" if ping_task and not ping_task.done() else "inactive",
-        "timestamp": datetime.now().isoformat(),
-        "stats": basic_stats
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.route("/set_webhook", methods=["GET"])
